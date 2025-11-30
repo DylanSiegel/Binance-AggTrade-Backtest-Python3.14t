@@ -1,0 +1,3043 @@
+(.venv) PS Z:\binance-data> python backtest.py
+[Scan] Indexing years=[2020, 2021, 2022, 2023, 2024, 2025] for BTCUSDT...
+[Scan] Found 2159 chunks.
+[Backtest] Processing 2159 chunks on 24 threads (Contiguous Block Mode)...
+[Backtest] Done in 279.08s
+
+--- CORE METRICS ---
+Years:       2020 -> 2025
+Trades:      5893
+Net PnL:     -26193.04 bps
+Avg Trade:   -4.44 bps
+Win Rate:    42.83%
+ProfitFact:  0.93
+TradeSharpe: -1.74
+
+--- BY KERNEL ---
+turbo        -> trades=5893, net=-26193.04 bps, sharpe=-1.74
+(.venv) PS Z:\binance-data> 
+
+--- File Tree Structure ---
+|-- algo.py
+|-- backtest.py
+|-- config.py
+|-- data/
+    |-- BTCUSDT/
+        |-- 2020/
+            |-- 01/
+            |-- 02/
+            |-- 03/
+            |-- 04/
+            |-- 05/
+            |-- 06/
+            |-- 07/
+            |-- 08/
+            |-- 09/
+            |-- 10/
+            |-- 11/
+            |-- 12/
+        |-- 2021/
+            |-- 01/
+            |-- 02/
+            |-- 03/
+            |-- 04/
+            |-- 05/
+            |-- 06/
+            |-- 07/
+            |-- 08/
+            |-- 09/
+            |-- 10/
+            |-- 11/
+            |-- 12/
+        |-- 2022/
+            |-- 01/
+            |-- 02/
+            |-- 03/
+            |-- 04/
+            |-- 05/
+            |-- 06/
+            |-- 07/
+            |-- 08/
+            |-- 09/
+            |-- 10/
+            |-- 11/
+            |-- 12/
+        |-- 2023/
+            |-- 01/
+            |-- 02/
+            |-- 03/
+            |-- 04/
+            |-- 05/
+            |-- 06/
+            |-- 07/
+            |-- 08/
+            |-- 09/
+            |-- 10/
+            |-- 11/
+            |-- 12/
+        |-- 2024/
+            |-- 01/
+            |-- 02/
+            |-- 03/
+            |-- 04/
+            |-- 05/
+            |-- 06/
+            |-- 07/
+            |-- 08/
+            |-- 09/
+            |-- 10/
+            |-- 11/
+            |-- 12/
+        |-- 2025/
+            |-- 01/
+            |-- 02/
+            |-- 03/
+            |-- 04/
+            |-- 05/
+            |-- 06/
+            |-- 07/
+            |-- 08/
+            |-- 09/
+            |-- 10/
+            |-- 11/
+|-- data-auto.py
+|-- data.py
+|-- metrics.py
+|-- quick.py
+|-- update.py
+|-- verify.py
+
+// --- File: algo.py ---
+
+```python
+"""
+algo.py — HYBRID TURBO v3.1 (Alpha Fix)
+Fixed directional logic in Kernel 1 residuals.
+Adjusted thresholds for realistic flow capture.
+"""
+
+import math
+import statistics
+from collections import deque
+from collections.abc import Iterable
+
+# AGG2 Row: id, px, qt, fi, cnt, flags, ts, side
+Row = tuple[int, int, int, int, int, int, int, int]
+RowIter = Iterable[Row]
+
+
+class AlphaEngine:
+    __slots__ = (
+        # Tick tracking
+        "last_ts_ms",
+        "last_lpx",
+        "cum_q",
+
+        # Flow (5m)
+        "flow_win",
+        "flow_sum",
+
+        # Volume bar build
+        "bar_target",
+        "bar_vol",
+        "bar_buy_vol",
+        "bar_sell_vol",
+        "bar_csum",
+        "bar_trades",
+        "bar_open_px",
+        "bar_high_px",
+        "bar_low_px",
+        "bar_close_px",
+        "bar_timestamp",
+
+        # Kernel 1 (Residuals)
+        "window",           # 3h window
+        "anchor_ts",
+        "anchor_x",
+        "anchor_Q",
+        "intercept",
+        "resid_hist",       # Sized for speed (2000)
+        "resid_mad",
+        "z_thresh",
+        "stats_counter",
+
+        # Kernel 2 (Iceberg)
+        "cc_hist",
+        "bar_info",
+        "flow_abs_hist",
+        "flow_quiet_thresh",
+        "last_iceberg_ts",
+        "last_k1_ts",       # Cooldown for K1
+    )
+
+    def __init__(self, symbol: str):
+        self.last_ts_ms = 0
+        self.last_lpx = 0.0
+        self.cum_q = 0.0
+
+        self.flow_win = deque()
+        self.flow_sum = 0.0
+
+        # Bar Def (Aggressive 350 BTC volume bars)
+        self.bar_target = 350.0
+        self.bar_vol = 0.0
+        self.bar_buy_vol = 0.0
+        self.bar_sell_vol = 0.0
+        self.bar_csum = 0.0
+        self.bar_trades = 0
+        self.bar_open_px = 0.0
+        self.bar_high_px = 0.0
+        self.bar_low_px = 0.0
+        self.bar_close_px = 0.0
+        self.bar_timestamp = 0
+
+        # Kernel 1
+        self.window = deque()
+        self.anchor_ts = 0
+        self.anchor_x = 0.0
+        self.anchor_Q = 0.0
+        self.intercept = 0.0
+
+        self.resid_hist = deque(maxlen=2000)
+        self.resid_mad = 0.001
+        self.z_thresh = 2.5
+        self.stats_counter = 0
+
+        # Kernel 2
+        self.cc_hist = deque(maxlen=400)
+        self.bar_info = deque(maxlen=32)
+        self.flow_abs_hist = deque(maxlen=400)
+        self.flow_quiet_thresh = 0.0
+        self.last_iceberg_ts = 0
+        self.last_k1_ts = 0
+
+    def _close_bar(self, signals: list):
+        ts = self.bar_timestamp
+        px = self.bar_close_px
+        lpx = math.log(px)
+
+        # ---------------------- Flow Management ----------------------
+        FIVE_MIN = 300_000
+        signed_flow = self.bar_buy_vol - self.bar_sell_vol
+        self.flow_win.append((ts, signed_flow))
+        self.flow_sum += signed_flow
+
+        while self.flow_win and ts - self.flow_win[0][0] > FIVE_MIN:
+            _, f = self.flow_win.popleft()
+            self.flow_sum -= f
+
+        # ---------------------- Kernel 1 Calc ----------------------
+        self.cum_q += signed_flow
+        self.window.append((ts, lpx, self.cum_q))
+        
+        THREE_HOURS = 10_800_000
+        while self.window and ts - self.window[0][0] > THREE_HOURS:
+            self.window.popleft()
+
+        if self.window:
+            self.anchor_ts, self.anchor_x, self.anchor_Q = self.window[0]
+        else:
+            self.anchor_ts, self.anchor_x, self.anchor_Q = ts, lpx, self.cum_q
+
+        # --- FIX: Directional Market Impact Model ---
+        dq_raw = self.cum_q - self.anchor_Q
+        dq_abs = abs(dq_raw) + 1.0
+        
+        # Impact is positive if buying (dq > 0), negative if selling
+        impact_sign = 1.0 if dq_raw >= 0 else -1.0
+        
+        # Model: Log-linear impact
+        # 0.4 is the 'k' factor (Kyle's lambda proxy)
+        theo = self.anchor_x + self.intercept + (0.4 * impact_sign * math.log(dq_abs))
+        
+        resid = lpx - theo
+        self.resid_hist.append(resid)
+
+        # ---------------------- Optimized Stats ----------------------
+        self.stats_counter += 1
+        if self.stats_counter >= 10 and len(self.resid_hist) >= 100:
+            self.stats_counter = 0
+            vals = list(self.resid_hist)
+            try:
+                med = statistics.median(vals)
+                dev = [abs(v - med) for v in vals]
+                mad = statistics.median(dev) or 0.0001
+                self.resid_mad = mad
+                
+                # Z-score thresholds (Top 2.5%)
+                zvals = [d / mad for d in dev]
+                cuts = statistics.quantiles(zvals, n=40, method="inclusive")
+                self.z_thresh = cuts[-1]
+            except:
+                pass
+
+        # Robust Intercept Update
+        if len(self.window) >= 20 and self.stats_counter == 5:
+            bases = []
+            x0 = self.anchor_x
+            q0 = self.anchor_Q
+            # Sparse sampling
+            for i in range(0, len(self.window), 5):
+                _, xi, Qi = self.window[i]
+                dQi = Qi - q0
+                s_i = 1.0 if dQi >= 0 else -1.0
+                bases.append(xi - x0 - (0.4 * s_i * math.log(abs(dQi) + 1.0)))
+            if bases:
+                self.intercept = statistics.median(bases)
+
+        # ---------------------- Kernel 1 Signal ----------------------
+        if self.resid_mad > 0.0 and len(self.resid_hist) >= 100:
+            z = resid / self.resid_mad
+            
+            # Adjusted Thresholds for v3.1
+            FLOW_THRESH = 35.0  # BTC net flow in 5m
+            K1_COOLDOWN = 300_000 # 5 mins
+            
+            if ts - self.last_k1_ts > K1_COOLDOWN:
+                # Short: Price is too HIGH relative to flow (Overshoot)
+                # OR Price is high and flow is turning negative (Divergence)
+                if z > self.z_thresh:
+                    if self.flow_sum < -FLOW_THRESH:
+                        signals.append((ts, px, -1))
+                        self.last_k1_ts = ts
+                    
+                # Long: Price is too LOW relative to flow (Undershoot)
+                # OR Price is low and flow is turning positive
+                elif z < -self.z_thresh:
+                    if self.flow_sum > FLOW_THRESH:
+                        signals.append((ts, px, +1))
+                        self.last_k1_ts = ts
+
+        # ---------------------- Kernel 2 (Iceberg) ----------------------
+        if self.bar_trades > 0:
+            cbar = self.bar_csum / self.bar_trades
+            ln_c = math.log1p(cbar)
+            self.cc_hist.append(ln_c)
+
+            z2 = 0.0
+            if len(self.cc_hist) >= 30:
+                mu = statistics.fmean(self.cc_hist)
+                sd = statistics.pstdev(self.cc_hist, mu)
+                if sd > 0:
+                    z2 = (ln_c - mu) / sd
+
+            self.bar_info.append((z2, self.bar_open_px, self.bar_close_px, ts))
+            self.flow_abs_hist.append(abs(self.flow_sum))
+
+            if len(self.flow_abs_hist) >= 40 and self.stats_counter == 0:
+                try:
+                    cuts = statistics.quantiles(self.flow_abs_hist, n=5, method="inclusive")
+                    self.flow_quiet_thresh = cuts[0]
+                except:
+                    pass
+
+            side2 = 0
+            if len(self.bar_info) >= 6:
+                B = self.bar_info
+                # Exhaustion Pattern: High activity (z2 > 2.0) -> Collapse (z2 < -1.0)
+                if abs(self.flow_sum) <= self.flow_quiet_thresh:
+                    prev_max = max(x[0] for x in list(B)[-6:-1])
+                    current_z = B[-1][0]
+                    
+                    if prev_max > 2.0 and current_z < -1.0:
+                        ex_open = B[-6][1]
+                        ex_close = B[-2][2]
+                        # Mean Reversion: Fade the explosion move
+                        if ex_close > ex_open * 1.001: # Up move > 10bps
+                            side2 = -1
+                        elif ex_close < ex_open * 0.999: # Down move > 10bps
+                            side2 = 1
+
+            COOLDOWN = 600_000 # 10 mins
+            if side2 != 0:
+                if ts - self.last_iceberg_ts >= COOLDOWN:
+                    signals.append((ts, px, side2))
+                    self.last_iceberg_ts = ts
+
+        # ---------------------- Reset Bar ----------------------
+        self.bar_vol = 0
+        self.bar_buy_vol = 0
+        self.bar_sell_vol = 0
+        self.bar_csum = 0
+        self.bar_trades = 0
+        self.bar_open_px = 0
+        self.bar_high_px = 0
+        self.bar_low_px = 0
+        self.bar_close_px = 0
+        self.bar_timestamp = 0
+
+    def update_batch(self, rows: RowIter):
+        """
+        High-Performance Vectorized Update.
+        """
+        PX_DIV = 100_000_000.0
+        QT_DIV = 100_000_000.0
+        signals = []
+
+        # Local cache
+        _log = math.log
+        _abs = abs
+        
+        b_vol = self.bar_vol
+        b_buy = self.bar_buy_vol
+        b_sell = self.bar_sell_vol
+        b_csum = self.bar_csum
+        b_trades = self.bar_trades
+        b_open = self.bar_open_px
+        b_high = self.bar_high_px
+        b_low = self.bar_low_px
+        b_target = self.bar_target
+        
+        last_px = 0.0
+        last_ts = 0
+
+        for r in rows:
+            px_raw = r[1]
+            if px_raw == 0: continue
+            
+            px = px_raw / PX_DIV
+            ts = r[6]
+            qt = r[2] / QT_DIV
+            
+            # r[7]: 0=Sell(MakerBuy), 1=Buy(TakerBuy)
+            # Logic: If Taker is Buy (1), Side=1. If Taker is Sell (0), Side=-1.
+            side = 1.0 if r[7] == 1 else -1.0 
+            
+            c = r[4]
+
+            if self.last_lpx == 0.0:
+                self.last_lpx = _log(px)
+                b_open = px
+                b_high = px
+                b_low = px
+                continue
+
+            vol = _abs(qt)
+            b_vol += vol
+            if side > 0:
+                b_buy += vol
+            else:
+                b_sell += vol
+            
+            b_csum += c
+            b_trades += 1
+
+            if px > b_high: b_high = px
+            if px < b_low: b_low = px
+            
+            last_px = px
+            last_ts = ts
+
+            if b_vol >= b_target:
+                self.bar_vol = b_vol
+                self.bar_buy_vol = b_buy
+                self.bar_sell_vol = b_sell
+                self.bar_csum = b_csum
+                self.bar_trades = b_trades
+                self.bar_open_px = b_open
+                self.bar_high_px = b_high
+                self.bar_low_px = b_low
+                self.bar_close_px = last_px
+                self.bar_timestamp = ts
+                
+                self._close_bar(signals)
+                
+                b_vol = 0.0
+                b_buy = 0.0
+                b_sell = 0.0
+                b_csum = 0.0
+                b_trades = 0
+                b_open = last_px
+                b_high = last_px
+                b_low = last_px
+
+        self.bar_vol = b_vol
+        self.bar_buy_vol = b_buy
+        self.bar_sell_vol = b_sell
+        self.bar_csum = b_csum
+        self.bar_trades = b_trades
+        self.bar_open_px = b_open
+        self.bar_high_px = b_high
+        self.bar_low_px = b_low
+        self.last_ts_ms = last_ts
+        if last_px > 0:
+            self.last_lpx = _log(last_px)
+
+        return signals
+```
+
+// --- End File: algo.py ---
+
+// --- File: backtest.py ---
+
+```python
+"""
+backtest.py (Contiguous Sharding, Data-Safe, Auto-Discover Years)
+Vectorized-style backtest on AGG2 blobs.
+
+CRITICAL FIX:
+- Sharding is now CONTIGUOUS (each worker sees a continuous time block).
+- Prevents artificial time gaps that destroyed performance under round-robin.
+- Years are auto-discovered from the data directory.
+"""
+
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import math
+
+# Mandatory 3.14t boilerplate
+if sys._is_gil_enabled():
+    raise RuntimeError("GIL must be disabled. Run with: python -X gil=0 backtest.py")
+
+CPU_THREADS = 24
+
+import os
+import time
+from typing import List, Tuple
+
+import config
+import algo
+import metrics
+
+try:
+    import compression.zstd as zstd
+except ImportError:
+    print("[FATAL] compression.zstd not found.")
+    sys.exit(1)
+
+# (data_path, offset, length, yyyy_mm_dd)
+JobType = Tuple[str, int, int, str]
+
+
+def discover_years(symbol: str) -> List[int]:
+    """
+    Auto-discover all years under BASE_DIR/symbol that actually contain
+    at least one month with (index.quantdev, data.quantdev).
+    """
+    base = os.path.join(config.BASE_DIR, symbol)
+    if not os.path.exists(base):
+        return []
+
+    years: List[int] = []
+    for name in os.listdir(base):
+        if not name.isdigit():
+            continue
+        try:
+            y = int(name)
+        except ValueError:
+            continue
+
+        year_path = os.path.join(base, name)
+        if not os.path.isdir(year_path):
+            continue
+
+        has_data = False
+        for m_name in os.listdir(year_path):
+            if not m_name.isdigit():
+                continue
+            month_path = os.path.join(year_path, m_name)
+            if not os.path.isdir(month_path):
+                continue
+
+            idx_path = os.path.join(month_path, "index.quantdev")
+            dat_path = os.path.join(month_path, "data.quantdev")
+            if os.path.exists(idx_path) and os.path.exists(dat_path):
+                has_data = True
+                break
+
+        if has_data:
+            years.append(y)
+
+    years.sort()
+    return years
+
+
+def scan_dataset(symbol: str, years: List[int]) -> List[JobType]:
+    """
+    Build a list of all (data_path, offset, length, date_str) jobs.
+    Sorted strictly chronologically: Year -> Month -> Day.
+    """
+    all_jobs: List[JobType] = []
+    print(f"[Scan] Indexing years={years} for {symbol}...")
+
+    for year in years:
+        for month in range(1, 13):
+            base = os.path.join(config.BASE_DIR, symbol, f"{year:04d}", f"{month:02d}")
+            idx_p = os.path.join(base, "index.quantdev")
+            dat_p = os.path.join(base, "data.quantdev")
+
+            if not os.path.exists(idx_p) or not os.path.exists(dat_p):
+                continue
+
+            try:
+                with open(idx_p, "rb") as f:
+                    idx_bytes = f.read()
+
+                month_jobs = []
+                ptr = 0
+                limit = len(idx_bytes)
+                while ptr < limit:
+                    # Index row: <HQQ> = Day, Offset, Length
+                    day, off, ln = config.INDEX_ROW_STRUCT.unpack_from(idx_bytes, ptr)
+                    ptr += config.INDEX_ROW_SIZE
+                    month_jobs.append((day, off, ln))
+
+                # Intra-month order
+                month_jobs.sort(key=lambda x: x[0])
+
+                for day, off, ln in month_jobs:
+                    date_str = f"{year:04d}-{month:02d}-{day:02d}"
+                    all_jobs.append((dat_p, off, ln, date_str))
+            except Exception as e:
+                print(f"[WARN] Failed to read index {idx_p}: {e}")
+                continue
+
+    # Global chronological order
+    all_jobs.sort(key=lambda j: j[3])
+    print(f"[Scan] Found {len(all_jobs)} chunks.")
+    return all_jobs
+
+
+def worker_process_shard(shard_id: int, jobs: List[JobType], symbol: str):
+    """
+    Process a CONTIGUOUS list of days with one AlphaEngine.
+    State flows naturally from Day N to Day N+1 within this shard.
+    """
+    engine = algo.AlphaEngine(symbol)
+    trades = []
+
+    position = 0
+    entry_px = 0.0
+    entry_ts = 0
+
+    last_px = 0.0
+    last_ts = 0
+
+    ROW = config.AGG_ROW_STRUCT
+    HDR = config.AGG_HDR_SIZE
+
+    for (path, off, ln, _) in jobs:
+        try:
+            with open(path, "rb") as f:
+                f.seek(off)
+                c_blob = f.read(ln)
+
+            raw = zstd.decompress(c_blob)
+        except Exception as e:
+            print(f"[WARN] Shard {shard_id}: blob read failed at {path}@{off}: {e}")
+            continue
+
+        # Vectorized update
+        signals = engine.update_batch(ROW.iter_unpack(raw[HDR:]))
+
+        for ts, px, sig in signals:
+            last_px = px
+            last_ts = ts
+
+            # EXIT LOGIC
+            if position != 0:
+                roi = (px - entry_px) / entry_px if position > 0 else (entry_px - px) / entry_px
+
+                # Take Profit (+40bps) / Stop Loss (-15bps)
+                if roi > 0.0040 or roi < -0.0015:
+                    pnl = (roi * 10000.0) - config.COST_BASIS_BPS
+                    trades.append(
+                        {
+                            "entry_ts": entry_ts,
+                            "exit_ts": ts,
+                            "net_pnl_bps": pnl,
+                            "side": position,
+                            "kernel": "turbo",
+                        }
+                    )
+                    position = 0
+
+            # ENTRY LOGIC (Only if flat)
+            if position == 0 and sig != 0:
+                position = sig
+                entry_px = px
+                entry_ts = ts
+
+    # Force close at end of shard to capture final PnL
+    if position != 0 and last_px > 0.0:
+        roi = (last_px - entry_px) / entry_px if position > 0 else (entry_px - last_px) / entry_px
+        pnl = (roi * 10000.0) - config.COST_BASIS_BPS
+        trades.append(
+            {
+                "entry_ts": entry_ts,
+                "exit_ts": last_ts,
+                "net_pnl_bps": pnl,
+                "side": position,
+                "kernel": "turbo",
+            }
+        )
+
+    return trades
+
+
+def run_backtest(years: List[int] | None = None):
+    symbol = config.SYMBOL
+
+    # Auto-discover full history if not provided
+    if years is None:
+        years = discover_years(symbol)
+        if not years:
+            print(f"[Backtest] No year folders found under {config.BASE_DIR}/{symbol}.")
+            return
+
+    t0 = time.perf_counter()
+
+    jobs = scan_dataset(symbol, years)
+    if not jobs:
+        print("[Backtest] No data jobs found.")
+        return
+
+    workers = config.WORKERS
+    if workers <= 0:
+        workers = 1
+
+    # --- CONTIGUOUS SHARDING ---
+    # Split jobs into continuous blocks instead of round-robin.
+    chunk_size = math.ceil(len(jobs) / workers)
+    shards: List[List[JobType]] = []
+    for i in range(0, len(jobs), chunk_size):
+        shards.append(jobs[i : i + chunk_size])
+
+    actual_workers = len(shards)
+    print(f"[Backtest] Processing {len(jobs)} chunks on {actual_workers} threads (Contiguous Block Mode)...")
+
+    trades = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(worker_process_shard, i, shards[i], symbol)
+            for i in range(actual_workers)
+        ]
+        for fut in futures:
+            res = fut.result()
+            if res:
+                trades.extend(res)
+
+    dt = time.perf_counter() - t0
+    print(f"[Backtest] Done in {dt:.2f}s")
+
+    if not trades:
+        print("[Backtest] No trades generated.")
+        return
+
+    report = metrics.full_report(trades)
+    core = report["core"]
+
+    print("\n--- CORE METRICS ---")
+    print(f"Years:       {years[0]} -> {years[-1]}")
+    print(f"Trades:      {core['total_trades']:.0f}")
+    print(f"Net PnL:     {core['net_pnl_bps']:.2f} bps")
+    print(f"Avg Trade:   {core['avg_trade_bps']:.2f} bps")
+    print(f"Win Rate:    {core['win_rate_pct']:.2f}%")
+    print(f"ProfitFact:  {core['profit_factor']:.2f}")
+    print(f"TradeSharpe: {core['trade_sharpe']:.2f}")
+
+    print("\n--- BY KERNEL ---")
+    for k, v in report["by_kernel"].items():
+        print(
+            f"{k:<12} -> trades={v['total_trades']:.0f}, "
+            f"net={v['net_pnl_bps']:.2f} bps, sharpe={v['trade_sharpe']:.2f}"
+        )
+
+
+if __name__ == "__main__":
+    # Full auto-discovered history by default
+    run_backtest()
+```
+
+// --- End File: backtest.py ---
+
+// --- File: config.py ---
+
+```python
+"""
+config.py
+Shared configuration and binary schema definitions.
+Optimized for Python 3.14t (Free-Threaded).
+"""
+import struct
+
+# --- DATA STORAGE ---
+BASE_DIR = "data"
+SYMBOL = "BTCUSDT"
+
+# --- BINARY SCHEMA (AGG2) ---
+# Row: <trade_id, px, qty, first_id, count, flags, ts_ms, side, padding>
+# 48 bytes per row
+AGG_ROW_STRUCT = struct.Struct("<QQQQHHqB3x")
+AGG_ROW_SIZE = AGG_ROW_STRUCT.size
+
+# Header: Magic + Version + Day + Reserved + Count + MinTS + MaxTS
+AGG_HDR_STRUCT = struct.Struct("<4sBBHQqq16x")
+AGG_HDR_SIZE = AGG_HDR_STRUCT.size
+AGG_HDR_MAGIC = b"AGG2"
+
+# Index: Day + Offset + Length
+INDEX_ROW_STRUCT = struct.Struct("<HQQ")
+INDEX_ROW_SIZE = INDEX_ROW_STRUCT.size
+
+# --- SCALING ---
+PX_SCALE = 100_000_000.0
+QT_SCALE = 100_000_000.0
+
+# --- SIMULATION ---
+TAKER_FEE_BPS = 4.0
+SLIPPAGE_BPS = 1.0
+COST_BASIS_BPS = TAKER_FEE_BPS + SLIPPAGE_BPS
+
+# --- HARDWARE OPTIMIZATION ---
+# Ryzen 9 7900X (24 Logical Threads)
+WORKERS = 24
+```
+
+// --- End File: config.py ---
+
+// --- File: data-auto.py ---
+
+```python
+"""
+data.py (Universal Edition)
+
+High-Frequency Data Engine for Python 3.14t (Free-Threaded)
+Target: Any Multi-Core CPU (Intel/AMD/ARM) running Python 3.14t
+"""
+
+import sys
+import os
+import gc
+import time
+import struct
+import datetime as dt
+import http.client
+import ssl
+import signal
+import zipfile
+import re
+import threading
+from io import BytesIO, TextIOWrapper
+from csv import reader as csv_reader
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ==============================================================================
+# 0. Runtime Environment Check
+# ==============================================================================
+
+if sys._is_gil_enabled():
+    print("[FATAL] This script requires Python 3.14t with GIL DISABLED.", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import compression.zstd as zstd
+except ImportError:
+    print("[FATAL] Native 'compression.zstd' not found.", file=sys.stderr)
+    sys.exit(1)
+
+# Auto-detect cores (e.g., 24 on Ryzen 7900X)
+SYSTEM_THREADS = os.cpu_count() or 4
+
+def _print_system_info():
+    print(f"[system] Detected {SYSTEM_THREADS} Logical Cores.")
+    print(f"[system] Runtime: {sys.version.split()[0]} (Free-Threaded)")
+
+# ==============================================================================
+# 1. Universal Configuration  <-- LOOK HERE TO EDIT
+# ==============================================================================
+
+CONFIG: dict[str, object] = {
+    # ----------------------------------------------------------------------
+    # [USER EDITABLE] Target Asset
+    # Change "BTCUSDT" to "ETHUSDT", "SOLUSDT", etc.
+    # ----------------------------------------------------------------------
+    "SYMBOL": "ETHUSDT",  # <<< CHANGE THIS for different coins
+
+    "BASE_DIR": "data",
+
+    # ----------------------------------------------------------------------
+    # [USER EDITABLE] Data Source / Market Type
+    # Options:
+    #   - USD-M Futures: "data/futures/um"  (Default)
+    #   - COIN-M Futures: "data/futures/cm"
+    #   - Spot Market:    "data/spot"
+    # ----------------------------------------------------------------------
+    "S3_PREFIX": "data/futures/um", # <<< CHANGE THIS for Spot/Futures
+    
+    "HOST_DATA": "data.binance.vision",
+    "DATASET":   "aggTrades",
+
+    # ----------------------------------------------------------------------
+    # [USER EDITABLE] Start Date
+    # If downloading a new coin (e.g., PEPE), set this to 2023-01-01
+    # to avoid scanning years of non-existent data.
+    # ----------------------------------------------------------------------
+    "FALLBACK_DATE": dt.date(2020, 1, 1), # <<< CHANGE THIS if coin is new
+
+    # Dynamic Tuning (Auto-scales to your CPU)
+    "WORKERS": SYSTEM_THREADS,
+    "ROWS_PER_CHUNK": 50_000,
+
+    # Network Resilience
+    "TIMEOUT": 15,
+    "RETRIES": 5,
+    "BACKOFF": 0.5,
+    "VERIFY_SSL": True,
+    "USER_AGENT": f"QuantEngine/3.14t (Auto-Scale: {SYSTEM_THREADS} cores)",
+}
+
+UTC = dt.timezone.utc
+_thread_local = threading.local()
+_stop_event = threading.Event()
+
+_ssl_context = ssl.create_default_context()
+if not CONFIG["VERIFY_SSL"]:
+    _ssl_context.check_hostname = False
+    _ssl_context.verify_mode = ssl.CERT_NONE
+
+# ==============================================================================
+# 2. Binary Schema (Fixed Standard)
+# ==============================================================================
+
+PX_SCALE = 100_000_000
+QT_SCALE = 100_000_000
+
+AGG_ROW_STRUCT = struct.Struct("<QQQQHHqB3x")
+AGG_ROW_SIZE = AGG_ROW_STRUCT.size
+AGG_HDR_STRUCT = struct.Struct("<4sBBHQqq16x")
+AGG_HDR_MAGIC = b"AGG2"
+INDEX_ROW_STRUCT = struct.Struct("<HQQ")
+INDEX_ROW_SIZE = INDEX_ROW_STRUCT.size
+FLAG_IS_BUYER_MAKER = 1 << 0
+
+# ==============================================================================
+# 3. Thread-Safe Locking & Storage
+# ==============================================================================
+
+_month_locks: dict[tuple[int, int], threading.Lock] = {}
+_guard = threading.Lock()
+
+def _get_month_lock(year: int, month: int) -> threading.Lock:
+    key = (year, month)
+    with _guard:
+        return _month_locks.setdefault(key, threading.Lock())
+
+def _ensure_paths(year: int, month: int) -> tuple[str, str, str]:
+    base_dir = str(CONFIG["BASE_DIR"])
+    symbol = str(CONFIG["SYMBOL"])
+    dir_path = os.path.join(base_dir, symbol, f"{year:04d}", f"{month:02d}")
+    os.makedirs(dir_path, exist_ok=True)
+    return (
+        dir_path,
+        os.path.join(dir_path, "data.quantdev"),
+        os.path.join(dir_path, "index.quantdev"),
+    )
+
+def _is_day_indexed(year: int, month: int, day: int) -> bool:
+    _, data_path, index_path = _ensure_paths(year, month)
+    
+    if not os.path.exists(index_path) or not os.path.exists(data_path):
+        return False
+
+    try:
+        data_size = os.path.getsize(data_path)
+        with open(index_path, "rb") as f:
+            while True:
+                chunk = f.read(INDEX_ROW_SIZE)
+                if not chunk or len(chunk) < INDEX_ROW_SIZE:
+                    break
+                d, offset, length = INDEX_ROW_STRUCT.unpack(chunk)
+                if d == day:
+                    if (offset + length) <= data_size:
+                        return True
+        return False
+    except OSError:
+        return False
+
+# ==============================================================================
+# 4. Universal Networking (Persistent)
+# ==============================================================================
+
+def _get_connection(host: str) -> http.client.HTTPSConnection:
+    conns = getattr(_thread_local, "conns", None)
+    if conns is None:
+        conns = {}
+        _thread_local.conns = conns
+
+    conn = conns.get(host)
+    if conn is None or conn.sock is None:
+        conn = http.client.HTTPSConnection(
+            host,
+            context=_ssl_context,
+            timeout=float(CONFIG["TIMEOUT"]),
+        )
+        conns[host] = conn
+    else:
+        conn.timeout = float(CONFIG["TIMEOUT"])
+    return conn
+
+def _close_connection(host: str) -> None:
+    conns = getattr(_thread_local, "conns", {})
+    if host in conns:
+        try:
+            conns[host].close()
+        except Exception:
+            pass
+        del conns[host]
+
+def _http_request(host: str, method: str, path: str) -> bytes | None:
+    headers = {
+        "User-Agent": str(CONFIG["USER_AGENT"]),
+        "Accept-Encoding": "identity",
+    }
+    retries = int(CONFIG["RETRIES"])
+    backoff = float(CONFIG["BACKOFF"])
+
+    for attempt in range(1, retries + 1):
+        if _stop_event.is_set():
+            return None
+        
+        conn = _get_connection(host)
+        try:
+            conn.request(method, path, headers=headers)
+            resp = conn.getresponse()
+            
+            if resp.status == 200:
+                return resp.read()
+            elif resp.status == 404:
+                resp.read() # Drain
+                return None
+            
+            resp.read()
+        except (http.client.HTTPException, OSError, ssl.SSLError):
+            _close_connection(host)
+        
+        if attempt < retries:
+            time.sleep(backoff * (2 ** (attempt - 1)))
+            
+    return None
+
+# ==============================================================================
+# 5. Genesis Detection
+# ==============================================================================
+
+def _fetch_genesis_date(symbol: str) -> dt.date:
+    host = str(CONFIG["HOST_DATA"])
+    dataset = str(CONFIG["DATASET"])
+    prefix = f"{CONFIG['S3_PREFIX']}/daily/{dataset}/{symbol}/"
+    path = f"/?prefix={prefix}&delimiter=/"
+
+    print(f"[init] Probing index: {host}{path}")
+    html_bytes = _http_request(host, "GET", path)
+
+    fallback = CONFIG["FALLBACK_DATE"]
+    if not isinstance(fallback, dt.date): fallback = dt.date(2020, 1, 1)
+
+    if not html_bytes:
+        print(f"[warn] Index unreachable. Defaulting to {fallback}")
+        return fallback
+
+    text = html_bytes.decode("utf-8", "replace")
+    
+    # Matches SYMBOL-DATASET-YYYY-MM-DD
+    pattern = rf"{re.escape(symbol)}-{re.escape(dataset)}-(\d{{4}}-\d{{2}}-\d{{2}})"
+    matches = re.findall(pattern, text, flags=re.IGNORECASE)
+
+    if not matches:
+        print(f"[warn] No files found in index. Defaulting to {fallback}")
+        return fallback
+
+    dates = []
+    for date_str in matches:
+        try:
+            dates.append(dt.datetime.strptime(date_str, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+
+    if not dates:
+        return fallback
+
+    return min(dates)
+
+# ==============================================================================
+# 6. Core Logic
+# ==============================================================================
+
+def _download_day_zip(day: dt.date) -> bytes | None:
+    year, month, day_str = day.year, f"{day.month:02d}", f"{day.day:02d}"
+    sym = str(CONFIG["SYMBOL"])
+    dataset = str(CONFIG["DATASET"])
+    prefix = str(CONFIG["S3_PREFIX"])
+    
+    path = (
+        f"/{prefix}/daily/{dataset}/{sym}/"
+        f"{sym}-{dataset}-{year}-{month}-{day_str}.zip"
+    )
+    return _http_request(str(CONFIG["HOST_DATA"]), "GET", path)
+
+def _process_zip_to_agg2(day: dt.date, zip_bytes: bytes) -> bytes | None:
+    buf_size = AGG_ROW_SIZE * int(CONFIG["ROWS_PER_CHUNK"])
+    
+    buf = getattr(_thread_local, "buf", None)
+    if buf is None or len(buf) != buf_size:
+        buf = bytearray(buf_size)
+        _thread_local.buf = buf
+
+    view = memoryview(buf)
+    pack_into = AGG_ROW_STRUCT.pack_into
+    chunks = []
+    c_min, c_max, total_count = 2**63 - 1, -2**63, 0
+
+    try:
+        with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
+            csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+            if not csv_names: return None
+            
+            with zf.open(csv_names[0], "r") as f_in:
+                wrapper = TextIOWrapper(f_in, encoding="utf-8", newline="")
+                reader = csv_reader(wrapper)
+                first_row = next(reader, None)
+                if not first_row: return None
+                
+                headers = [h.replace("_", "").lower().strip() for h in first_row]
+                idx = {"id": 0, "px": 1, "qt": 2, "fi": 3, "li": 4, "ts": 5, "bm": 6}
+                
+                if "aggtradeid" in headers or "id" in headers:
+                    m = {name: i for i, name in enumerate(headers)}
+                    idx["id"] = m.get("aggtradeid", m.get("id", 0))
+                    idx["px"] = m.get("price", 1)
+                    idx["qt"] = m.get("quantity", 2)
+                    idx["fi"] = m.get("firsttradeid", 3)
+                    idx["li"] = m.get("lasttradeid", 4)
+                    idx["ts"] = m.get("transacttime", 5)
+                    idx["bm"] = m.get("isbuyermaker", 6)
+
+                offset = 0
+
+                def _process(rows):
+                    nonlocal offset, total_count, c_min, c_max
+                    for row in rows:
+                        if not row: continue
+                        try:
+                            ts = int(row[idx["ts"]])
+                            if ts < c_min: c_min = ts
+                            if ts > c_max: c_max = ts
+                            
+                            fi, li = int(row[idx["fi"]]), int(row[idx["li"]])
+                            cnt = li - fi + 1
+                            if cnt < 0: continue
+                            if cnt > 65535: cnt = 65535
+
+                            px = int(float(row[idx["px"]]) * PX_SCALE)
+                            qt = int(float(row[idx["qt"]]) * QT_SCALE)
+                            is_maker = row[idx["bm"]].lower() in ("true", "1", "t")
+
+                            pack_into(view, offset, 
+                                      int(row[idx["id"]]), px, qt, fi, cnt, 
+                                      FLAG_IS_BUYER_MAKER if is_maker else 0, 
+                                      ts, 
+                                      0 if is_maker else 1)
+                            
+                            offset += AGG_ROW_SIZE
+                            total_count += 1
+                            if offset >= buf_size:
+                                chunks.append(view[:offset].tobytes())
+                                offset = 0
+                        except (ValueError, IndexError): continue
+
+                if "aggtradeid" not in headers and "price" not in headers:
+                    _process([first_row])
+                _process(reader)
+                
+                if offset > 0: chunks.append(view[:offset].tobytes())
+
+    except Exception as e:
+        print(f"[parse-err] {day}: {e}", file=sys.stderr)
+        return None
+
+    if total_count == 0: return b""
+    hdr = AGG_HDR_STRUCT.pack(AGG_HDR_MAGIC, 1, day.day, 0, total_count, c_min, c_max)
+    return hdr + b"".join(chunks)
+
+def _worker_task(day: dt.date) -> str:
+    if _stop_event.is_set(): return "stop"
+    
+    y, m, d = day.year, day.month, day.day
+    if _is_day_indexed(y, m, d): return "skip"
+    
+    zip_data = _download_day_zip(day)
+    if _stop_event.is_set(): return "stop"
+    if zip_data is None: return "missing"
+    
+    agg_blob = _process_zip_to_agg2(day, zip_data)
+    if not agg_blob: return "error" if agg_blob is None else "missing"
+    
+    try: c_blob = zstd.compress(agg_blob, level=3)
+    except Exception: return "error"
+    
+    blob_len = len(c_blob)
+    lock = _get_month_lock(y, m)
+    _, d_path, i_path = _ensure_paths(y, m)
+    
+    try:
+        with lock:
+            if _is_day_indexed(y, m, d): return "skip"
+            
+            if not os.path.exists(d_path):
+                with open(d_path, "ab"): pass
+            
+            start_offset = os.path.getsize(d_path)
+            
+            with open(i_path, "ab") as f_idx:
+                f_idx.write(INDEX_ROW_STRUCT.pack(d, start_offset, blob_len))
+                f_idx.flush()
+                os.fsync(f_idx.fileno())
+            
+            with open(d_path, "ab") as f_data:
+                f_data.write(c_blob)
+                f_data.flush()
+                os.fsync(f_data.fileno())
+                
+        return "ok"
+    except OSError as e:
+        print(f"[io-err] {day}: {e}", file=sys.stderr)
+        return "error"
+
+# ==============================================================================
+# 7. Main Entry
+# ==============================================================================
+
+def main() -> None:
+    signal.signal(signal.SIGINT, lambda s, f: _stop_event.set())
+    
+    _print_system_info()
+    print(f"[job] Symbol: {CONFIG['SYMBOL']}")
+    print(f"[job] Source: {CONFIG['HOST_DATA']}")
+
+    start_date = _fetch_genesis_date(str(CONFIG["SYMBOL"]))
+    print(f"[job] Start Date: {start_date}")
+
+    end_date = dt.datetime.now(UTC).date() - dt.timedelta(days=1)
+    if end_date < start_date:
+        print("[info] Up to date (End date < Start date).")
+        return
+
+    days = [start_date + dt.timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    print(f"[job] Queue: {len(days)} days")
+
+    stats = {"ok": 0, "skip": 0, "missing": 0, "error": 0, "stop": 0}
+    gc.disable()
+    start_time = time.perf_counter()
+    
+    try:
+        with ThreadPoolExecutor(max_workers=int(CONFIG["WORKERS"])) as pool:
+            future_to_day = {pool.submit(_worker_task, d): d for d in days}
+            completed = 0
+            
+            for future in as_completed(future_to_day):
+                day = future_to_day[future]
+                try: 
+                    res = future.result()
+                except Exception as e:
+                    print(f"\n[err] {day}: {e}", file=sys.stderr)
+                    res = "error"
+                
+                stats[res] = stats.get(res, 0) + 1
+                completed += 1
+                
+                char = {"ok": "D", "skip": ".", "missing": "_", "error": "!", "stop": "S"}.get(res, "?")
+                sys.stdout.write(char)
+                if completed % 100 == 0: sys.stdout.write(f" | {completed}\n")
+                sys.stdout.flush()
+                
+                if completed % 1000 == 0: gc.collect()
+
+    finally:
+        gc.enable()
+        elapsed = time.perf_counter() - start_time
+        print(f"\n\n[Done] Time: {elapsed:.2f}s")
+        print(f"[Stats] {stats}")
+
+if __name__ == "__main__":
+    main()
+```
+
+// --- End File: data-auto.py ---
+
+// --- File: data.py ---
+
+```python
+#!/usr/bin/env python3.14t
+"""
+data.py (v3.0 - Free-Threaded, Atomic-ish, No Self-Healing)
+
+Target runtime:
+- Python 3.14t, GIL disabled (-X gil=0)
+- Windows 11
+- AMD Ryzen 9 7900X (12C / 24T)
+
+Constraints:
+- Standard library only
+- CPU-bound = threading / ThreadPoolExecutor (no multiprocessing)
+- Compression via compression.zstd only
+
+Properties:
+- Uses file.tell() for index offsets under a per-month lock.
+- Month-scoped locks serialize writes while still allowing parallel processing of many days.
+- No self-healing/truncation: crashes may leave unreachable bytes at the end of data files,
+  but index entries never point to non-existent bytes.
+"""
+
+import os
+import time
+import struct
+import datetime as dt
+import http.client
+import ssl
+import signal
+import zipfile
+from io import BytesIO, TextIOWrapper
+from csv import reader as csv_reader
+
+import sys, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---------------------------------------------------------------------------
+# 0. Mandatory 3.14t / Free-threaded boilerplate
+# ---------------------------------------------------------------------------
+
+if sys._is_gil_enabled():
+    raise RuntimeError("GIL must be disabled (run Python 3.14t with -X gil=0)")
+
+CPU_THREADS = 24
+
+try:
+    import compression.zstd as zstd
+except ImportError as exc:
+    raise RuntimeError("Native 'compression.zstd' (PEP 784) is required.") from exc
+
+# ---------------------------------------------------------------------------
+# 1. Configuration
+# ---------------------------------------------------------------------------
+
+CONFIG: dict[str, object] = {
+    # Change this to the symbol you want
+    "SYMBOL": "BTCUSDT",
+
+    # Directory where data will be saved: ./data/SYMBOL/YYYY/MM/...
+    "BASE_DIR": "data",
+
+    # Binance Data Source Settings (UM Futures aggTrades)
+    "HOST_DATA": "data.binance.vision",
+    "S3_PREFIX": "data/futures/um",
+    "DATASET": "aggTrades",
+
+    # Start Date: you can change this to tighten the backfill window
+    "FALLBACK_DATE": dt.date(2020, 1, 1),
+
+    # Threads
+    "WORKERS": CPU_THREADS,
+    "ROWS_PER_CHUNK": 50_000,
+
+    # Network
+    "TIMEOUT": 10,
+    "RETRIES": 5,
+    "BACKOFF": 0.5,
+    "VERIFY_SSL": True,
+    "USER_AGENT": "QuantEngine/3.14t data.py",
+}
+
+# ---------------------------------------------------------------------------
+# 2. Binary Schema (must match update.py)
+# ---------------------------------------------------------------------------
+
+PX_SCALE = 100_000_000
+QT_SCALE = 100_000_000
+
+# Per-row payload:
+#   trade_id, price_scaled, qty_scaled, first_trade_id, count (H),
+#   flags (H), timestamp (q), side(B), padding
+AGG_ROW_STRUCT = struct.Struct("<QQQQHHqB3x")
+AGG_ROW_SIZE = AGG_ROW_STRUCT.size
+
+# File header:
+#   magic(4s) = b"AGG2"
+#   version(B)
+#   day(B)
+#   reserved(H)
+#   row_count(Q)
+#   min_ts(q)
+#   max_ts(q)
+#   padding(16x)
+AGG_HDR_STRUCT = struct.Struct("<4sBBHQqq16x")
+AGG_HDR_MAGIC = b"AGG2"
+
+# Index row: day (H), offset (Q), length (Q)
+INDEX_ROW_STRUCT = struct.Struct("<HQQ")
+INDEX_ROW_SIZE = INDEX_ROW_STRUCT.size
+
+FLAG_IS_BUYER_MAKER = 1 << 0
+
+# ---------------------------------------------------------------------------
+# 3. Global State & Locks
+# ---------------------------------------------------------------------------
+
+_thread_local = threading.local()
+_stop_event = threading.Event()
+
+_month_locks: dict[tuple[int, int], threading.Lock] = {}
+_guard = threading.Lock()
+
+_ssl_context = ssl.create_default_context()
+if not CONFIG["VERIFY_SSL"]:
+    _ssl_context.check_hostname = False
+    _ssl_context.verify_mode = ssl.CERT_NONE
+
+
+def _get_month_lock(year: int, month: int) -> threading.Lock:
+    key = (year, month)
+    with _guard:
+        lock = _month_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _month_locks[key] = lock
+        return lock
+
+
+def _ensure_paths(year: int, month: int) -> tuple[str, str, str]:
+    base_dir = str(CONFIG["BASE_DIR"])
+    symbol = str(CONFIG["SYMBOL"])
+    dir_path = os.path.join(base_dir, symbol, f"{year:04d}", f"{month:02d}")
+    os.makedirs(dir_path, exist_ok=True)
+    data_path = os.path.join(dir_path, "data.quantdev")
+    index_path = os.path.join(dir_path, "index.quantdev")
+    return dir_path, data_path, index_path
+
+
+def _is_day_indexed(year: int, month: int, day: int) -> bool:
+    """
+    Returns True if index has an entry for this day AND that entry points to
+    bytes fully contained in the data file. If an entry points beyond EOF,
+    we treat it as 'not indexed' to allow overwrite on reruns.
+    """
+    _, data_path, index_path = _ensure_paths(year, month)
+
+    if not os.path.exists(index_path) or not os.path.exists(data_path):
+        return False
+
+    try:
+        data_size = os.path.getsize(data_path)
+        with open(index_path, "rb") as f:
+            while True:
+                raw = f.read(INDEX_ROW_SIZE)
+                if not raw or len(raw) < INDEX_ROW_SIZE:
+                    break
+                d, offset, length = INDEX_ROW_STRUCT.unpack(raw)
+                if d == day and (offset + length) <= data_size:
+                    return True
+    except OSError:
+        return False
+    return False
+
+# ---------------------------------------------------------------------------
+# 4. Networking
+# ---------------------------------------------------------------------------
+
+
+def _get_connection(host: str) -> http.client.HTTPSConnection:
+    conns = getattr(_thread_local, "conns", None)
+    if conns is None:
+        conns = {}
+        _thread_local.conns = conns
+
+    conn = conns.get(host)
+    if conn is None or conn.sock is None:
+        conn = http.client.HTTPSConnection(
+            host,
+            context=_ssl_context,
+            timeout=float(CONFIG["TIMEOUT"]),
+        )
+        conns[host] = conn
+    else:
+        conn.timeout = float(CONFIG["TIMEOUT"])
+    return conn
+
+
+def _close_connection(host: str) -> None:
+    conns = getattr(_thread_local, "conns", None)
+    if not conns:
+        return
+    conn = conns.pop(host, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _http_request(host: str, method: str, path: str) -> bytes | None:
+    headers = {
+        "User-Agent": str(CONFIG["USER_AGENT"]),
+        "Accept-Encoding": "identity",
+    }
+    retries = int(CONFIG["RETRIES"])
+    backoff = float(CONFIG["BACKOFF"])
+
+    for attempt in range(1, retries + 1):
+        if _stop_event.is_set():
+            return None
+
+        conn = _get_connection(host)
+        try:
+            conn.request(method, path, headers=headers)
+            resp = conn.getresponse()
+            try:
+                if resp.status == 200:
+                    return resp.read()
+                if resp.status == 404:
+                    resp.read()
+                    return None
+                resp.read()
+            finally:
+                resp.close()
+        except (http.client.HTTPException, OSError, ssl.SSLError):
+            _close_connection(host)
+
+        if attempt < retries:
+            time.sleep(backoff * (2 ** (attempt - 1)))
+
+    return None
+
+# ---------------------------------------------------------------------------
+# 5. Transform Zip -> AGG2
+# ---------------------------------------------------------------------------
+
+
+def _download_day_zip(day: dt.date) -> bytes | None:
+    year = day.year
+    month_str = f"{day.month:02d}"
+    day_str = f"{day.day:02d}"
+
+    sym = str(CONFIG["SYMBOL"])
+    dataset = str(CONFIG["DATASET"])
+    prefix = str(CONFIG["S3_PREFIX"])
+
+    path = (
+        f"/{prefix}/daily/{dataset}/{sym}/"
+        f"{sym}-{dataset}-{year}-{month_str}-{day_str}.zip"
+    )
+    return _http_request(str(CONFIG["HOST_DATA"]), "GET", path)
+
+
+def _process_zip_to_agg2(day: dt.date, zip_bytes: bytes | None) -> bytes | None:
+    if not zip_bytes:
+        return None
+
+    buf_size = AGG_ROW_SIZE * int(CONFIG["ROWS_PER_CHUNK"])
+
+    buf = getattr(_thread_local, "buf", None)
+    if buf is None or len(buf) != buf_size:
+        buf = bytearray(buf_size)
+        _thread_local.buf = buf
+
+    view = memoryview(buf)
+    pack_into = AGG_ROW_STRUCT.pack_into
+    chunks: list[bytes] = []
+    c_min, c_max, total_count = 2**63 - 1, -2**63, 0
+
+    try:
+        with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
+            csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+            if not csv_names:
+                return None
+
+            with zf.open(csv_names[0], "r") as f_in:
+                wrapper = TextIOWrapper(f_in, encoding="utf-8", newline="")
+                reader = csv_reader(wrapper)
+                first_row = next(reader, None)
+                if not first_row:
+                    return None
+
+                headers = [h.replace("_", "").lower().strip() for h in first_row]
+                idx: dict[str, int] = {
+                    "id": 0,
+                    "px": 1,
+                    "qt": 2,
+                    "fi": 3,
+                    "li": 4,
+                    "ts": 5,
+                    "bm": 6,
+                }
+
+                if "aggtradeid" in headers or "id" in headers:
+                    m = {name: i for i, name in enumerate(headers)}
+                    idx["id"] = m.get("aggtradeid", m.get("id", 0))
+                    idx["px"] = m.get("price", 1)
+                    idx["qt"] = m.get("quantity", 2)
+                    idx["fi"] = m.get("firsttradeid", 3)
+                    idx["li"] = m.get("lasttradeid", 4)
+                    idx["ts"] = m.get("transacttime", 5)
+                    idx["bm"] = m.get("isbuyermaker", 6)
+
+                offset = 0
+
+                def _process(rows) -> None:
+                    nonlocal offset, total_count, c_min, c_max
+                    for row in rows:
+                        if not row:
+                            continue
+                        try:
+                            ts = int(row[idx["ts"]])
+                            if ts < c_min:
+                                c_min = ts
+                            if ts > c_max:
+                                c_max = ts
+
+                            fi = int(row[idx["fi"]])
+                            li = int(row[idx["li"]])
+                            cnt = li - fi + 1
+                            if cnt < 0:
+                                continue
+                            if cnt > 65535:
+                                cnt = 65535
+
+                            px = int(float(row[idx["px"]]) * PX_SCALE)
+                            qt = int(float(row[idx["qt"]]) * QT_SCALE)
+
+                            is_maker = row[idx["bm"]].lower() in ("true", "1", "t")
+
+                            pack_into(
+                                view,
+                                offset,
+                                int(row[idx["id"]]),
+                                px,
+                                qt,
+                                fi,
+                                cnt,
+                                FLAG_IS_BUYER_MAKER if is_maker else 0,
+                                ts,
+                                0 if is_maker else 1,
+                            )
+                            offset += AGG_ROW_SIZE
+                            total_count += 1
+
+                            if offset >= buf_size:
+                                chunks.append(view[:offset].tobytes())
+                                offset = 0
+                        except (ValueError, IndexError):
+                            continue
+
+                # If headers do not look like typical aggTrades, treat first row as data
+                if "aggtradeid" not in headers and "price" not in headers:
+                    _process([first_row])
+                _process(reader)
+
+                if offset > 0:
+                    chunks.append(view[:offset].tobytes())
+
+    except Exception:
+        return None
+
+    if total_count == 0:
+        return b""
+
+    hdr = AGG_HDR_STRUCT.pack(
+        AGG_HDR_MAGIC,
+        1,         # version
+        day.day,   # day
+        0,         # reserved
+        total_count,
+        c_min,
+        c_max,
+    )
+    return hdr + b"".join(chunks)
+
+# ---------------------------------------------------------------------------
+# 6. Per-day worker (atomic-ish writer, no healing)
+# ---------------------------------------------------------------------------
+
+
+def _process_day(day: dt.date) -> str:
+    if _stop_event.is_set():
+        return "stop"
+
+    y, m, d = day.year, day.month, day.day
+
+    # Quick check before network
+    if _is_day_indexed(y, m, d):
+        return "skip"
+
+    zip_data = _download_day_zip(day)
+    if _stop_event.is_set():
+        return "stop"
+    if zip_data is None:
+        return "missing"
+
+    agg_blob = _process_zip_to_agg2(day, zip_data)
+    if agg_blob is None:
+        return "error"
+    if not agg_blob:
+        return "missing"
+
+    try:
+        c_blob = zstd.compress(agg_blob, level=3)
+    except Exception:
+        return "error"
+
+    blob_len = len(c_blob)
+    lock = _get_month_lock(y, m)
+    _, data_path, index_path = _ensure_paths(y, m)
+
+    try:
+        with lock:
+            # Authoritative re-check under the month lock
+            if _is_day_indexed(y, m, d):
+                return "skip"
+
+            # Ensure data file exists
+            if not os.path.exists(data_path):
+                with open(data_path, "ab"):
+                    pass
+
+            # 1) append compressed block and get true offset via tell()
+            with open(data_path, "ab") as f_data:
+                start_offset = f_data.tell()
+                f_data.write(c_blob)
+                f_data.flush()
+                os.fsync(f_data.fileno())
+
+            # 2) append index row referencing fully written block
+            with open(index_path, "ab") as f_idx:
+                f_idx.write(INDEX_ROW_STRUCT.pack(d, start_offset, blob_len))
+                f_idx.flush()
+                os.fsync(f_idx.fileno())
+
+        return "ok"
+    except OSError:
+        return "error"
+
+# ---------------------------------------------------------------------------
+# 7. Chunk worker (for exactly 24 chunks)
+# ---------------------------------------------------------------------------
+
+
+def _worker_chunk(days: list[dt.date]) -> dict[str, int]:
+    stats: dict[str, int] = {"ok": 0, "skip": 0, "missing": 0, "error": 0, "stop": 0}
+    for day in days:
+        if _stop_event.is_set():
+            stats["stop"] += 1
+            break
+        res = _process_day(day)
+        stats[res] = stats.get(res, 0) + 1
+        if res == "stop":
+            break
+    return stats
+
+# ---------------------------------------------------------------------------
+# 8. Utility: split work into exactly 24 chunks
+# ---------------------------------------------------------------------------
+
+
+def _split_into_chunks(seq: list[dt.date], n: int) -> list[list[dt.date]]:
+    length = len(seq)
+    if n <= 0:
+        return [seq]
+
+    base = length // n
+    rem = length % n
+
+    chunks: list[list[dt.date]] = []
+    idx = 0
+    for i in range(n):
+        size = base + (1 if i < rem else 0)
+        chunk = seq[idx:idx + size] if size > 0 else []
+        chunks.append(chunk)
+        idx += size
+    return chunks
+
+# ---------------------------------------------------------------------------
+# 9. Main
+# ---------------------------------------------------------------------------
+
+
+def _signal_handler(signum: int, frame) -> None:
+    _stop_event.set()
+
+
+def main() -> None:
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    symbol = str(CONFIG["SYMBOL"])
+    print(f"--- data.py (3.0) | Symbol: {symbol} ---")
+
+    start_date = CONFIG["FALLBACK_DATE"]
+    if not isinstance(start_date, dt.date):
+        start_date = dt.date(2020, 1, 1)
+
+    today_utc = dt.datetime.now(dt.timezone.utc).date()
+    end_date = today_utc - dt.timedelta(days=1)
+
+    if end_date < start_date:
+        print("[init] Nothing to do: end_date < start_date")
+        return
+
+    total_days = (end_date - start_date).days + 1
+    days: list[dt.date] = [
+        start_date + dt.timedelta(days=i) for i in range(total_days)
+    ]
+
+    print(f"[job] Downloading {len(days)} days from {start_date} to {end_date}.")
+
+    # Split into exactly 24 chunks (some may be empty)
+    chunks = _split_into_chunks(days, CPU_THREADS)
+
+    global_stats: dict[str, int] = {
+        "ok": 0,
+        "skip": 0,
+        "missing": 0,
+        "error": 0,
+        "stop": 0,
+    }
+
+    t0 = time.perf_counter()
+
+    with ThreadPoolExecutor(max_workers=CPU_THREADS) as executor:
+        futures = [executor.submit(_worker_chunk, chunk) for chunk in chunks]
+
+        completed_chunks = 0
+        for fut in as_completed(futures):
+            chunk_stats = fut.result()
+            for k, v in chunk_stats.items():
+                global_stats[k] = global_stats.get(k, 0) + v
+            completed_chunks += 1
+            # Optional simple progress indicator by chunk:
+            print(f"[chunk] {completed_chunks}/{CPU_THREADS} completed")
+
+    elapsed = time.perf_counter() - t0
+    print(f"[done] {elapsed:.2f}s | stats={global_stats}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+// --- End File: data.py ---
+
+// --- File: metrics.py ---
+
+```python
+"""
+metrics.py
+Robust Statistics Engine.
+"""
+import math
+import statistics
+
+def core_trade_metrics(trades):
+    # Default safe return
+    ret = {
+        "total_trades": 0,
+        "net_pnl_bps": 0.0,
+        "avg_trade_bps": 0.0,
+        "win_rate_pct": 0.0,
+        "profit_factor": 0.0,
+        "trade_sharpe": 0.0
+    }
+    
+    if not trades:
+        return ret
+    
+    pnls = [float(t["net_pnl_bps"]) for t in trades]
+    wins = [p for p in pnls if p > 0.0]
+    losses = [p for p in pnls if p <= 0.0]
+
+    gross = sum(pnls)
+    count = len(pnls)
+    
+    # Avoid div by zero
+    mean = gross / count if count > 0 else 0.0
+    var = statistics.pvariance(pnls) if count > 1 else 0.0
+    std = math.sqrt(var)
+
+    win_rate = (len(wins) / count) * 100.0 if count > 0 else 0.0
+    profit_factor = (sum(wins) / abs(sum(losses))) if losses and sum(losses) != 0 else 0.0
+    trade_sharpe = (mean / std) * math.sqrt(count) if std > 0.0 else 0.0
+
+    return {
+        "total_trades": float(count),
+        "net_pnl_bps": float(gross),
+        "avg_trade_bps": float(mean),
+        "win_rate_pct": float(win_rate),
+        "profit_factor": float(profit_factor),
+        "trade_sharpe": float(trade_sharpe),
+    }
+
+def full_report(trades):
+    core = core_trade_metrics(trades)
+    
+    by_kernel = {}
+    for t in trades:
+        k = t.get("kernel", "unknown")
+        if k not in by_kernel: by_kernel[k] = []
+        by_kernel[k].append(t)
+    
+    k_stats = {k: core_trade_metrics(v) for k, v in by_kernel.items()}
+    
+    return {"core": core, "by_kernel": k_stats, "risk": {}}
+```
+
+// --- End File: metrics.py ---
+
+// --- File: quick.py ---
+
+```python
+"""
+quick.py
+Rapid Verification - Auto-Latest (Data-Safe, Ordered).
+
+Automatically finds the newest 6 months of data and runs a 24-core simulation,
+reusing the same sharding + worker logic as backtest.py.
+"""
+
+import sys, threading
+from concurrent.futures import ThreadPoolExecutor
+
+# Mandatory 3.14t boilerplate
+if sys._is_gil_enabled():
+    print("!!! WARNING: GIL is ENABLED. Run with: python -X gil=0 quick.py")
+
+CPU_THREADS = 24
+
+import time
+import os
+from typing import List, Tuple
+
+import config
+import backtest
+import metrics
+
+
+def get_latest_months(symbol: str, n: int = 6) -> List[Tuple[int, int]]:
+    """
+    Scans the data directory to find the most recent N (year, month) folders
+    that actually have an index.quantdev present.
+    """
+    base = os.path.join(config.BASE_DIR, symbol)
+    if not os.path.exists(base):
+        return []
+
+    try:
+        years = [d for d in os.listdir(base) if d.isdigit()]
+        years.sort(key=int, reverse=True)  # 2025, 2024, ...
+    except Exception:
+        return []
+
+    results: List[Tuple[int, int]] = []
+    for y_str in years:
+        y_int = int(y_str)
+        y_path = os.path.join(base, y_str)
+        try:
+            months = [d for d in os.listdir(y_path) if d.isdigit()]
+            months.sort(key=int, reverse=True)  # 12, 11, ...
+        except Exception:
+            continue
+
+        for m_str in months:
+            m_int = int(m_str)
+            base_path = os.path.join(y_path, m_str)
+            idx_path = os.path.join(base_path, "index.quantdev")
+            dat_path = os.path.join(base_path, "data.quantdev")
+            if os.path.exists(idx_path) and os.path.exists(dat_path):
+                results.append((y_int, m_int))
+                if len(results) >= n:
+                    return results
+
+    return results
+
+
+def run_latest_6_months():
+    symbol = config.SYMBOL
+
+    # 1. DISCOVERY
+    target_months = get_latest_months(symbol, n=6)
+    if not target_months:
+        print(f"[Fail] No data folders found for {symbol}")
+        return
+
+    # Sorted chronological for reporting
+    target_months.sort()
+    start_str = f"{target_months[0][0]:04d}-{target_months[0][1]:02d}"
+    end_str = f"{target_months[-1][0]:04d}-{target_months[-1][1]:02d}"
+
+    print(f"--- QUICK CHECK: {symbol} [Last 6 Months] ---")
+    print(f"Range: {start_str} to {end_str}")
+    print(f"Cores: {config.WORKERS} (Ryzen 7900X)")
+
+    # 2. JOB SCANNING (DATA-SAFE: month-internal sort by Day)
+    print(f"[1/4] Scanning indices for last 6 months...")
+
+    jobs: List[Tuple[str, int, int, str]] = []
+    for (year, month) in target_months:
+        base_path = os.path.join(config.BASE_DIR, symbol, f"{year:04d}", f"{month:02d}")
+        index_path = os.path.join(base_path, "index.quantdev")
+        data_path = os.path.join(base_path, "data.quantdev")
+
+        if not os.path.exists(index_path) or not os.path.exists(data_path):
+            continue
+
+        try:
+            with open(index_path, "rb") as f:
+                idx_bytes = f.read()
+
+            month_jobs = []
+            ptr = 0
+            limit = len(idx_bytes)
+            while ptr < limit:
+                day, off, ln = config.INDEX_ROW_STRUCT.unpack_from(idx_bytes, ptr)
+                ptr += config.INDEX_ROW_SIZE
+                month_jobs.append((day, off, ln))
+
+            # CRITICAL: sort by Day (not by write order)
+            month_jobs.sort(key=lambda x: x[0])
+
+            for day, off, ln in month_jobs:
+                jobs.append(
+                    (
+                        data_path,
+                        off,
+                        ln,
+                        f"{year:04d}-{month:02d}-{day:02d}",
+                    )
+                )
+        except Exception as e:
+            print(f"[WARN] Failed to read index {index_path}: {e}")
+            continue
+
+    if not jobs:
+        print("[Fail] Indices found but no jobs. Run data.py.")
+        return
+
+    # Enforce chronological order across all months by date string
+    jobs.sort(key=lambda j: j[3])
+
+    # 3. SHARDING
+    workers = config.WORKERS
+    if workers != CPU_THREADS:
+        print(f"[WARN] config.WORKERS={workers} but CPU_THREADS={CPU_THREADS}")
+
+    shards: List[List[Tuple[str, int, int, str]]] = [[] for _ in range(workers)]
+    for i, job in enumerate(jobs):
+        shards[i % workers].append(job)
+
+    print(f"[2/4] Sharded {len(jobs)} chunks across {workers} workers.")
+
+    # 4. PARALLEL EXECUTION (reuse backtest.worker_process_shard)
+    print(f"[3/4] Executing Turbo Engine (vectorized)...")
+    t0 = time.perf_counter()
+    all_trades = []
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(backtest.worker_process_shard, i, shards[i], symbol)
+            for i in range(workers)
+            if shards[i]
+        ]
+        for fut in futures:
+            res = fut.result()
+            if res:
+                all_trades.extend(res)
+
+    elapsed = time.perf_counter() - t0
+
+    # 5. METRICS
+    print(f"\n[4/4] Done in {elapsed:.4f}s")
+    if elapsed > 0:
+        # Rough row estimate: if you want exact, you would need to read AGG_HDR count per chunk.
+        rows_est = len(jobs) * 50_000.0
+        print(f"Throughput (rough): {rows_est / elapsed:,.0f} rows/sec")
+
+    print("\n--- Strategy Performance (Recent 6 Months) ---")
+    print(f"Period: {start_str} -> {end_str}")
+
+    if all_trades:
+        rep = metrics.full_report(all_trades)
+        core = rep["core"]
+        print(f"Trades:   {int(core['total_trades'])}")
+        print(f"Net PnL:  {core['net_pnl_bps']:.2f} bps")
+        print(f"Sharpe:   {core['trade_sharpe']:.2f}")
+        print(f"Win Rate: {core['win_rate_pct']:.2f}%")
+
+        print("\n[Kernel Contribution]")
+        for k, v in rep["by_kernel"].items():
+            print(f"  {k:<12}: {v['net_pnl_bps']:8.2f} bps")
+    else:
+        print("[WARN] No trades generated. (Check thresholds in algo.py.)")
+
+
+if __name__ == "__main__":
+    run_latest_6_months()
+```
+
+// --- End File: quick.py ---
+
+// --- File: update.py ---
+
+```python
+#!/usr/bin/env python3.14t
+"""
+update.py (Universal Auto-Updater for AGG2 data)
+
+Target runtime:
+- Python 3.14t, GIL disabled (-X gil=0)
+- Windows 11
+- AMD Ryzen 9 7900X (12C / 24T)
+
+Constraints:
+- Standard library only
+- CPU-bound = threading / ThreadPoolExecutor (no multiprocessing)
+- Compression via compression.zstd only
+
+Purpose:
+    1. Scans BASE_DIR to find all existing symbols (coins).
+    2. For each symbol, computes the date range to sync.
+    3. Fills gaps and appends new days in the same format as data.py.
+
+Storage format (per symbol, per month):
+    BASE_DIR/SYMBOL/YYYY/MM/data.quantdev   : concatenated compressed day blobs
+    BASE_DIR/SYMBOL/YYYY/MM/index.quantdev  : sequence of <day, offset, length>
+"""
+
+import os
+import re
+import gc
+import time
+import struct
+import datetime as dt
+import http.client
+import ssl
+import signal
+import zipfile
+from io import BytesIO, TextIOWrapper
+from csv import reader as csv_reader
+from pathlib import Path
+
+import sys, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---------------------------------------------------------------------------
+# 0. Mandatory 3.14t / Free-threaded boilerplate
+# ---------------------------------------------------------------------------
+
+if sys._is_gil_enabled():
+    raise RuntimeError("GIL must be disabled. Run Python 3.14t with -X gil=0")
+
+CPU_THREADS = 24  # Ryzen 9 7900X logical threads
+
+try:
+    import compression.zstd as zstd
+except ImportError as exc:
+    raise RuntimeError("Native 'compression.zstd' (PEP 784) is required.") from exc
+
+# ---------------------------------------------------------------------------
+# 1. Configuration
+# ---------------------------------------------------------------------------
+
+CONFIG: dict[str, object] = {
+    "BASE_DIR": "data",
+
+    # Network / source settings (must match data.py)
+    "HOST_DATA": "data.binance.vision",
+    "S3_PREFIX": "data/futures/um",   # UM futures
+    "DATASET": "aggTrades",
+
+    # Lower bound if genesis probing fails
+    "FALLBACK_DATE": dt.date(2020, 1, 1),
+
+    # Threading
+    "WORKERS": CPU_THREADS,
+    "ROWS_PER_CHUNK": 50_000,
+
+    # Network policy
+    "TIMEOUT": 15,
+    "RETRIES": 5,
+    "BACKOFF": 0.5,
+    "VERIFY_SSL": True,
+    "USER_AGENT": f"QuantEngine/3.14t Updater ({CPU_THREADS} threads)",
+}
+
+UTC = dt.timezone.utc
+_thread_local = threading.local()
+_stop_event = threading.Event()
+
+_ssl_context = ssl.create_default_context()
+if not CONFIG["VERIFY_SSL"]:
+    _ssl_context.check_hostname = False
+    _ssl_context.verify_mode = ssl.CERT_NONE
+
+# ---------------------------------------------------------------------------
+# 2. Binary Schema (must match data.py)
+# ---------------------------------------------------------------------------
+
+PX_SCALE = 100_000_000
+QT_SCALE = 100_000_000
+
+AGG_HDR_MAGIC = b"AGG2"
+
+AGG_ROW_STRUCT = struct.Struct("<QQQQHHqB3x")
+AGG_ROW_SIZE = AGG_ROW_STRUCT.size
+
+AGG_HDR_STRUCT = struct.Struct("<4sBBHQqq16x")
+INDEX_ROW_STRUCT = struct.Struct("<HQQ")
+INDEX_ROW_SIZE = INDEX_ROW_STRUCT.size
+
+FLAG_IS_BUYER_MAKER = 1 << 0
+
+# ---------------------------------------------------------------------------
+# 3. Locks & Path Helpers (per symbol/month)
+# ---------------------------------------------------------------------------
+
+_month_locks: dict[tuple[str, int, int], threading.Lock] = {}
+_guard = threading.Lock()
+
+
+def _get_month_lock(symbol: str, year: int, month: int) -> threading.Lock:
+    key = (symbol, year, month)
+    with _guard:
+        lock = _month_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _month_locks[key] = lock
+        return lock
+
+
+def _ensure_paths(symbol: str, year: int, month: int) -> tuple[str, str, str]:
+    base_dir = str(CONFIG["BASE_DIR"])
+    dir_path = os.path.join(base_dir, symbol, f"{year:04d}", f"{month:02d}")
+    os.makedirs(dir_path, exist_ok=True)
+    data_path = os.path.join(dir_path, "data.quantdev")
+    index_path = os.path.join(dir_path, "index.quantdev")
+    return dir_path, data_path, index_path
+
+
+def _is_day_indexed(symbol: str, year: int, month: int, day: int) -> bool:
+    """
+    True if index has an entry for this (symbol, year, month, day) and that entry
+    points entirely within the current data file.
+
+    If an index row exists but offset+length > data_size, treat as NOT indexed
+    so we can safely append a new valid block on rerun.
+    """
+    _, data_path, index_path = _ensure_paths(symbol, year, month)
+
+    if not os.path.exists(index_path) or not os.path.exists(data_path):
+        return False
+
+    try:
+        data_size = os.path.getsize(data_path)
+        with open(index_path, "rb") as f:
+            while True:
+                raw = f.read(INDEX_ROW_SIZE)
+                if not raw or len(raw) < INDEX_ROW_SIZE:
+                    break
+                d, offset, length = INDEX_ROW_STRUCT.unpack(raw)
+                if d == day and (offset + length) <= data_size:
+                    return True
+    except OSError:
+        return False
+    return False
+
+# ---------------------------------------------------------------------------
+# 4. Networking
+# ---------------------------------------------------------------------------
+
+
+def _get_connection(host: str) -> http.client.HTTPSConnection:
+    conns = getattr(_thread_local, "conns", None)
+    if conns is None:
+        conns = {}
+        _thread_local.conns = conns
+
+    conn = conns.get(host)
+    if conn is None or conn.sock is None:
+        conn = http.client.HTTPSConnection(
+            host,
+            context=_ssl_context,
+            timeout=float(CONFIG["TIMEOUT"]),
+        )
+        conns[host] = conn
+    else:
+        conn.timeout = float(CONFIG["TIMEOUT"])
+    return conn
+
+
+def _close_connection(host: str) -> None:
+    conns = getattr(_thread_local, "conns", None)
+    if not conns:
+        return
+    conn = conns.pop(host, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _http_request(host: str, method: str, path: str) -> bytes | None:
+    headers = {
+        "User-Agent": str(CONFIG["USER_AGENT"]),
+        "Accept-Encoding": "identity",
+    }
+    retries = int(CONFIG["RETRIES"])
+    backoff = float(CONFIG["BACKOFF"])
+
+    for attempt in range(1, retries + 1):
+        if _stop_event.is_set():
+            return None
+
+        conn = _get_connection(host)
+        try:
+            conn.request(method, path, headers=headers)
+            resp = conn.getresponse()
+            try:
+                if resp.status == 200:
+                    return resp.read()
+                if resp.status == 404:
+                    resp.read()
+                    return None
+                resp.read()
+            finally:
+                resp.close()
+        except (http.client.HTTPException, OSError, ssl.SSLError):
+            _close_connection(host)
+
+        if attempt < retries:
+            time.sleep(backoff * (2 ** (attempt - 1)))
+
+    return None
+
+# ---------------------------------------------------------------------------
+# 5. Genesis Detection (per symbol)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_genesis_date(symbol: str) -> dt.date:
+    """
+    Try to detect earliest available date for this symbol by scraping
+    the S3 listing from data.binance.vision.
+
+    If anything fails, return FALLBACK_DATE.
+    """
+    host = str(CONFIG["HOST_DATA"])
+    dataset = str(CONFIG["DATASET"])
+    prefix = f"{CONFIG['S3_PREFIX']}/daily/{dataset}/{symbol}/"
+    path = f"/?prefix={prefix}&delimiter=/"
+
+    html_bytes = _http_request(host, "GET", path)
+
+    fallback = CONFIG["FALLBACK_DATE"]
+    if not isinstance(fallback, dt.date):
+        fallback = dt.date(2020, 1, 1)
+
+    if not html_bytes:
+        return fallback
+
+    text = html_bytes.decode("utf-8", "replace")
+    pattern = rf"{re.escape(symbol)}-{re.escape(dataset)}-(\d{{4}}-\d{{2}}-\d{{2}})"
+    matches = re.findall(pattern, text, flags=re.IGNORECASE)
+    if not matches:
+        return fallback
+
+    dates: list[dt.date] = []
+    for date_str in matches:
+        try:
+            dates.append(dt.datetime.strptime(date_str, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+
+    return min(dates) if dates else fallback
+
+# ---------------------------------------------------------------------------
+# 6. Download + Transform (same as data.py semantics)
+# ---------------------------------------------------------------------------
+
+
+def _download_day_zip(symbol: str, day: dt.date) -> bytes | None:
+    year = day.year
+    month_str = f"{day.month:02d}"
+    day_str = f"{day.day:02d}"
+
+    dataset = str(CONFIG["DATASET"])
+    prefix = str(CONFIG["S3_PREFIX"])
+
+    path = (
+        f"/{prefix}/daily/{dataset}/{symbol}/"
+        f"{symbol}-{dataset}-{year}-{month_str}-{day_str}.zip"
+    )
+    return _http_request(str(CONFIG["HOST_DATA"]), "GET", path)
+
+
+def _process_zip_to_agg2(day: dt.date, zip_bytes: bytes | None) -> bytes | None:
+    if not zip_bytes:
+        return None
+
+    buf_size = AGG_ROW_SIZE * int(CONFIG["ROWS_PER_CHUNK"])
+
+    buf = getattr(_thread_local, "buf", None)
+    if buf is None or len(buf) != buf_size:
+        buf = bytearray(buf_size)
+        _thread_local.buf = buf
+
+    view = memoryview(buf)
+    pack_into = AGG_ROW_STRUCT.pack_into
+    chunks: list[bytes] = []
+    c_min, c_max, total_count = 2**63 - 1, -2**63, 0
+
+    try:
+        with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
+            csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+            if not csv_names:
+                return None
+
+            with zf.open(csv_names[0], "r") as f_in:
+                wrapper = TextIOWrapper(f_in, encoding="utf-8", newline="")
+                reader = csv_reader(wrapper)
+                first_row = next(reader, None)
+                if not first_row:
+                    return None
+
+                headers = [h.replace("_", "").lower().strip() for h in first_row]
+                idx: dict[str, int] = {
+                    "id": 0,
+                    "px": 1,
+                    "qt": 2,
+                    "fi": 3,
+                    "li": 4,
+                    "ts": 5,
+                    "bm": 6,
+                }
+
+                if "aggtradeid" in headers or "id" in headers:
+                    m = {name: i for i, name in enumerate(headers)}
+                    idx["id"] = m.get("aggtradeid", m.get("id", 0))
+                    idx["px"] = m.get("price", 1)
+                    idx["qt"] = m.get("quantity", 2)
+                    idx["fi"] = m.get("firsttradeid", 3)
+                    idx["li"] = m.get("lasttradeid", 4)
+                    idx["ts"] = m.get("transacttime", 5)
+                    idx["bm"] = m.get("isbuyermaker", 6)
+
+                offset = 0
+
+                def _process(rows) -> None:
+                    nonlocal offset, total_count, c_min, c_max
+                    for row in rows:
+                        if not row:
+                            continue
+                        try:
+                            ts = int(row[idx["ts"]])
+                            if ts < c_min:
+                                c_min = ts
+                            if ts > c_max:
+                                c_max = ts
+
+                            fi = int(row[idx["fi"]])
+                            li = int(row[idx["li"]])
+                            cnt = li - fi + 1
+                            if cnt < 0:
+                                continue
+                            if cnt > 65535:
+                                cnt = 65535
+
+                            px = int(float(row[idx["px"]]) * PX_SCALE)
+                            qt = int(float(row[idx["qt"]]) * QT_SCALE)
+                            is_maker = row[idx["bm"]].lower() in ("true", "1", "t")
+
+                            pack_into(
+                                view,
+                                offset,
+                                int(row[idx["id"]]),
+                                px,
+                                qt,
+                                fi,
+                                cnt,
+                                FLAG_IS_BUYER_MAKER if is_maker else 0,
+                                ts,
+                                0 if is_maker else 1,
+                            )
+                            offset += AGG_ROW_SIZE
+                            total_count += 1
+
+                            if offset >= buf_size:
+                                chunks.append(view[:offset].tobytes())
+                                offset = 0
+                        except (ValueError, IndexError):
+                            continue
+
+                if "aggtradeid" not in headers and "price" not in headers:
+                    _process([first_row])
+                _process(reader)
+
+                if offset > 0:
+                    chunks.append(view[:offset].tobytes())
+
+    except Exception:
+        return None
+
+    if total_count == 0:
+        return b""
+
+    hdr = AGG_HDR_STRUCT.pack(
+        AGG_HDR_MAGIC,
+        1,          # version
+        day.day,    # day
+        0,          # reserved
+        total_count,
+        c_min,
+        c_max,
+    )
+    return hdr + b"".join(chunks)
+
+# ---------------------------------------------------------------------------
+# 7. Per-day worker (atomic-ish writer, no self-healing)
+# ---------------------------------------------------------------------------
+
+
+def _process_day(symbol: str, day: dt.date) -> str:
+    if _stop_event.is_set():
+        return "stop"
+
+    y, m, d = day.year, day.month, day.day
+
+    if _is_day_indexed(symbol, y, m, d):
+        return "skip"
+
+    zip_data = _download_day_zip(symbol, day)
+    if _stop_event.is_set():
+        return "stop"
+    if zip_data is None:
+        return "missing"
+
+    agg_blob = _process_zip_to_agg2(day, zip_data)
+    if agg_blob is None:
+        return "error"
+    if not agg_blob:
+        return "missing"
+
+    try:
+        c_blob = zstd.compress(agg_blob, level=3)
+    except Exception:
+        return "error"
+
+    blob_len = len(c_blob)
+    lock = _get_month_lock(symbol, y, m)
+    _, data_path, index_path = _ensure_paths(symbol, y, m)
+
+    try:
+        with lock:
+            if _is_day_indexed(symbol, y, m, d):
+                return "skip"
+
+            # ensure data file exists
+            if not os.path.exists(data_path):
+                with open(data_path, "ab"):
+                    pass
+
+            # 1) append compressed block and get true offset via tell()
+            with open(data_path, "ab") as f_data:
+                start_offset = f_data.tell()
+                f_data.write(c_blob)
+                f_data.flush()
+                os.fsync(f_data.fileno())
+
+            # 2) append index row referencing fully written block
+            with open(index_path, "ab") as f_idx:
+                f_idx.write(INDEX_ROW_STRUCT.pack(d, start_offset, blob_len))
+                f_idx.flush()
+                os.fsync(f_idx.fileno())
+
+        return "ok"
+    except OSError:
+        return "error"
+
+# ---------------------------------------------------------------------------
+# 8. Chunk worker and chunking utility (exactly 24 chunks)
+# ---------------------------------------------------------------------------
+
+
+def _worker_chunk(symbol: str, days: list[dt.date]) -> dict[str, int]:
+    stats: dict[str, int] = {"ok": 0, "skip": 0, "missing": 0, "error": 0, "stop": 0}
+    for day in days:
+        if _stop_event.is_set():
+            stats["stop"] += 1
+            break
+        res = _process_day(symbol, day)
+        stats[res] = stats.get(res, 0) + 1
+        if res == "stop":
+            break
+    return stats
+
+
+def _split_into_chunks(seq: list[dt.date], n: int) -> list[list[dt.date]]:
+    length = len(seq)
+    if n <= 0:
+        return [seq]
+
+    base = length // n
+    rem = length % n
+
+    chunks: list[list[dt.date]] = []
+    idx = 0
+    for i in range(n):
+        size = base + (1 if i < rem else 0)
+        if size > 0:
+            chunk = seq[idx:idx + size]
+        else:
+            chunk = []
+        chunks.append(chunk)
+        idx += size
+    return chunks
+
+# ---------------------------------------------------------------------------
+# 9. High-level per-symbol updater
+# ---------------------------------------------------------------------------
+
+
+def _update_symbol(symbol: str) -> None:
+    print(f"\n=== Updating {symbol} ===")
+
+    start_date = _fetch_genesis_date(symbol)
+    today_utc = dt.datetime.now(UTC).date()
+    end_date = today_utc - dt.timedelta(days=1)
+
+    if end_date < start_date:
+        print("   -> Up to date (no days after genesis).")
+        return
+
+    days: list[dt.date] = [
+        start_date + dt.timedelta(days=i)
+        for i in range((end_date - start_date).days + 1)
+    ]
+    print(f"   -> Date range: {start_date} to {end_date} ({len(days)} days)")
+
+    # Split into exactly 24 chunks (some may be empty)
+    chunks = _split_into_chunks(days, CPU_THREADS)
+
+    stats: dict[str, int] = {
+        "ok": 0,
+        "skip": 0,
+        "missing": 0,
+        "error": 0,
+        "stop": 0,
+    }
+
+    gc.disable()
+    try:
+        with ThreadPoolExecutor(max_workers=CPU_THREADS) as executor:
+            futures = {
+                executor.submit(_worker_chunk, symbol, chunk): idx
+                for idx, chunk in enumerate(chunks)
+            }
+
+            completed_chunks = 0
+            for fut in as_completed(futures):
+                chunk_idx = futures[fut]
+                try:
+                    chunk_stats = fut.result()
+                except Exception:
+                    chunk_stats = {"error": 0}
+                    chunk_stats["error"] = 1
+
+                for k, v in chunk_stats.items():
+                    stats[k] = stats.get(k, 0) + v
+
+                completed_chunks += 1
+                print(
+                    f"   -> Chunk {completed_chunks}/{CPU_THREADS} done for {symbol} "
+                    f"(ok={stats['ok']}, skip={stats['skip']}, "
+                    f"missing={stats['missing']}, error={stats['error']})"
+                )
+    finally:
+        gc.enable()
+
+    print(f"   -> Final stats for {symbol}: {stats}")
+
+# ---------------------------------------------------------------------------
+# 10. Main
+# ---------------------------------------------------------------------------
+
+
+def _signal_handler(signum: int, frame) -> None:
+    _stop_event.set()
+
+
+def main() -> None:
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    base = Path(str(CONFIG["BASE_DIR"]))
+    if not base.exists():
+        print(f"[error] Base data directory '{base}' not found.")
+        return
+
+    # Discover symbols (top-level dirs under BASE_DIR)
+    symbols = [
+        d.name for d in base.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+    ]
+    symbols.sort()
+
+    if not symbols:
+        print(f"[error] No symbols found under '{base}'. Run data.py first.")
+        return
+
+    print(f"=== Universal Updater ===")
+    print(f"Found {len(symbols)} symbols: {', '.join(symbols[:5])}{'...' if len(symbols) > 5 else ''}")
+    print(f"Using {CPU_THREADS} worker threads.\n")
+
+    for idx, symbol in enumerate(symbols, start=1):
+        if _stop_event.is_set():
+            break
+        print(f"[{idx}/{len(symbols)}] Symbol: {symbol}")
+        _update_symbol(symbol)
+
+    print("\n[Done] All symbols processed.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+// --- End File: update.py ---
+
+// --- File: verify.py ---
+
+```python
+#!/usr/bin/env python3.14t
+"""
+verify_v2.py
+
+High-Performance Integrity Verifier for AGG2 Data format.
+Optimized for: Python 3.14t (Free-Threaded) on Ryzen 9 7900X
+Optimization: struct.iter_unpack, Hot Loop Unrolling, Local Var Caching
+"""
+
+import sys
+import struct
+import json
+import time
+import datetime as dt
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---------------------------------------------------------------------------
+# 0. Runtime / 3.14t Boilerplate
+# ---------------------------------------------------------------------------
+
+if sys._is_gil_enabled():
+    raise RuntimeError("Critical: GIL must be disabled. Run with -X gil=0")
+
+# Ryzen 9 7900X: 12 Cores / 24 Threads
+CPU_THREADS = 24 
+
+# PEP 784 Native Compression
+try:
+    import compression.zstd as zstd
+except ImportError:
+    raise RuntimeError("Critical: Native 'compression.zstd' not found.")
+
+# ============================================================================
+# Configuration & Constants
+# ============================================================================
+
+CONFIG: dict[str, object] = {
+    "BASE_DIR": "data",
+    "REPORT_FILE": "integrity_report_v2.json",
+    "WORKERS": CPU_THREADS,
+    "SYMBOL": "BTCUSDT",
+}
+
+AGG_HDR_MAGIC = b"AGG2"
+
+# Structures
+# <trade_id, px, qty, first_id, count, flags, ts_ms, side, padding>
+# Size: 8+8+8+8+2+1+8+1+3 = 47 bytes? No, struct alignment might apply.
+# We trust the struct definitions provided previously.
+AGG_ROW_STRUCT = struct.Struct("<QQQQHHqB3x")
+AGG_HDR_STRUCT = struct.Struct("<4sBBHQqq16x")
+INDEX_ROW_STRUCT = struct.Struct("<HQQ")
+
+# ============================================================================
+# Core Logic
+# ============================================================================
+
+def validate_month(year: int, month: int, path: Path) -> dict:
+    """
+    Validates a single month folder using optimized iterators.
+    """
+    stats = {
+        "period": f"{year}-{month:02d}",
+        "valid": True,
+        "days_checked": 0,
+        "rows_checked": 0,
+        "errors": [],
+        "gaps": [],
+        "warnings": [],
+    }
+
+    # Optimization: Cache append methods to avoid dict lookups in hot loop
+    err_append = stats["errors"].append
+    gap_append = stats["gaps"].append
+    warn_append = stats["warnings"].append
+
+    data_path = path / "data.quantdev"
+    index_path = path / "index.quantdev"
+
+    if not data_path.exists() or not index_path.exists():
+        return stats
+
+    try:
+        data_size = data_path.stat().st_size
+
+        # 1. Fast Index Read
+        index_entries = []
+        with open(index_path, "rb") as f_idx:
+            # Read entire index into memory (it's small)
+            idx_blob = f_idx.read()
+            
+        # Unpack index using iterator (Fast)
+        try:
+            index_entries = sorted(
+                list(INDEX_ROW_STRUCT.iter_unpack(idx_blob)), 
+                key=lambda x: x[1]
+            )
+        except struct.error:
+            err_append(f"Index file corruption or size mismatch")
+            stats["valid"] = False
+            return stats
+
+        # 2. Process Data File
+        with open(data_path, "rb") as f_data:
+            for day_num, offset, length in index_entries:
+                stats["days_checked"] += 1
+
+                # Bounds Check
+                if offset + length > data_size:
+                    err_append(f"Day {day_num}: Offset out of bounds")
+                    stats["valid"] = False
+                    continue
+
+                # Read Compressed Chunk
+                f_data.seek(offset)
+                compressed_blob = f_data.read(length)
+                
+                if len(compressed_blob) != length:
+                    err_append(f"Day {day_num}: Unexpected EOF")
+                    stats["valid"] = False
+                    continue
+
+                # Decompress
+                try:
+                    raw_blob = zstd.decompress(compressed_blob)
+                except Exception as e:
+                    err_append(f"Day {day_num}: Decompression failed ({e})")
+                    stats["valid"] = False
+                    continue
+
+                # Header Validation
+                if len(raw_blob) < AGG_HDR_STRUCT.size:
+                    err_append(f"Day {day_num}: Blob too small")
+                    stats["valid"] = False
+                    continue
+
+                # Unpack Header
+                # Slicing bytes creates a copy, but header is tiny (scrappy overhead)
+                magic, ver, h_day, _, row_count, ts_min, ts_max = \
+                    AGG_HDR_STRUCT.unpack(raw_blob[:AGG_HDR_STRUCT.size])
+
+                if magic != AGG_HDR_MAGIC:
+                    err_append(f"Day {day_num}: Invalid magic")
+                    stats["valid"] = False
+                    continue
+                
+                if h_day != day_num:
+                    err_append(f"Day {day_num}: Header day mismatch")
+                    stats["valid"] = False
+
+                expected_payload = row_count * AGG_ROW_STRUCT.size
+                row_data_start = AGG_HDR_STRUCT.size
+                
+                # Check explicit payload size
+                if len(raw_blob) - row_data_start != expected_payload:
+                    err_append(f"Day {day_num}: Size mismatch (Expected {expected_payload})")
+                    stats["valid"] = False
+                    continue
+
+                # -------------------------------------------------------
+                # CRITICAL HOT PATH
+                # -------------------------------------------------------
+                
+                # Create iterator directly on the buffer (Zero-copy if using memoryview context, 
+                # but iter_unpack handles buffer protocol efficiently)
+                try:
+                    # Note: We slice raw_blob to skip header. 
+                    # Python 3.14t optimizes slicing somewhat, but memoryview is safest for zero-copy.
+                    with memoryview(raw_blob) as mv:
+                        payload_mv = mv[row_data_start:]
+                        row_iter = AGG_ROW_STRUCT.iter_unpack(payload_mv)
+                        
+                        # --- Loop Unrolling: Handle First Row ---
+                        try:
+                            # Unpack: tid, px, qty, fid, cnt, flg, ts, side
+                            first_row = next(row_iter)
+                            prev_id, prev_px, prev_qt, _, _, _, prev_ts, _ = first_row
+                            
+                            # Validations for first row
+                            if prev_px <= 0 or prev_qt < 0:
+                                err_append(f"Day {day_num}: Invalid Px/Qty at ID {prev_id}")
+                                stats["valid"] = False
+                            
+                            stats["rows_checked"] += 1
+                        except StopIteration:
+                            # Empty day (valid)
+                            continue
+
+                        # --- The Inner Loop (Millions of iterations) ---
+                        # Optimization: Localize variables to register/stack
+                        # No 'is not None' checks here.
+                        
+                        for tid, px, qt, fid, cnt, flg, ts, side in row_iter:
+                            
+                            # 1. ID Monotonicity
+                            # Most common case: tid == prev_id + 1
+                            if tid != prev_id + 1:
+                                if tid <= prev_id:
+                                    err_append(f"Day {day_num}: Non-monotonic ID {prev_id}->{tid}")
+                                    stats["valid"] = False
+                                else:
+                                    gap_append({"day": day_num, "from": prev_id, "to": tid})
+
+                            # 2. Time Monotonicity
+                            if ts < prev_ts:
+                                err_append(f"Day {day_num}: Time warp {prev_ts}->{ts}")
+                                stats["valid"] = False
+
+                            # 3. Data Integrity
+                            if px <= 0 or qt < 0:
+                                err_append(f"Day {day_num}: Invalid Px/Qty at ID {tid}")
+                                stats["valid"] = False
+
+                            # 4. Aggregation Logic
+                            if (fid + cnt - 1) < fid:
+                                err_append(f"Day {day_num}: Invalid agg count at ID {tid}")
+                                stats["valid"] = False
+                            
+                            # 5. Header Bounds (Warning only)
+                            # Using 'or' is slightly slower if first condition is true, 
+                            # but usually ts is within bounds.
+                            if ts < ts_min or ts > ts_max:
+                                warn_append(f"Day {day_num}: TS {ts} outside header [{ts_min}, {ts_max}]")
+
+                            # Update registers
+                            prev_id = tid
+                            prev_ts = ts
+                            stats["rows_checked"] += 1
+
+                except struct.error:
+                    err_append(f"Day {day_num}: Corrupt struct alignment or incomplete bytes")
+                    stats["valid"] = False
+
+    except Exception as e:
+        err_append(f"Critical IO Error: {e}")
+        stats["valid"] = False
+
+    return stats
+
+# ============================================================================
+# Main Controller
+# ============================================================================
+
+def main() -> None:
+    start_time = time.perf_counter()
+    symbol_dir = Path(CONFIG["BASE_DIR"]) / str(CONFIG["SYMBOL"])
+
+    if not symbol_dir.exists():
+        print(f"Error: Directory {symbol_dir} not found.")
+        return
+
+    # Discovery
+    tasks: list[tuple[int, int, Path]] = []
+    print(f"--- High-Performance Integrity Verifier v2 (Ryzen 9 7900X) ---")
+    print(f"Target: Python 3.14t (Free-Threaded)")
+    
+    for year_dir in symbol_dir.iterdir():
+        if year_dir.is_dir() and year_dir.name.isdigit():
+            for month_dir in year_dir.iterdir():
+                if month_dir.is_dir() and month_dir.name.isdigit():
+                    tasks.append((int(year_dir.name), int(month_dir.name), month_dir))
+
+    # Sort tasks for consistent output
+    tasks.sort()
+    
+    print(f"Tasks: {len(tasks)} months")
+    print(f"Threads: {CONFIG['WORKERS']}")
+
+    results = []
+    total_rows = 0
+    corruption_count = 0
+
+    # ThreadPoolExecutor in 3.14t scales linearly for CPU tasks
+    with ThreadPoolExecutor(max_workers=int(CONFIG["WORKERS"])) as executor:
+        future_map = {
+            executor.submit(validate_month, y, m, p): (y, m)
+            for (y, m, p) in tasks
+        }
+
+        for i, future in enumerate(as_completed(future_map)):
+            y, m = future_map[future]
+            try:
+                res = future.result()
+                results.append(res)
+                rows = int(res["rows_checked"])
+                total_rows += rows
+                
+                status = "PASS" if res["valid"] else "FAIL"
+                if not res["valid"]:
+                    corruption_count += 1
+                
+                # Simple progress bar
+                sys.stdout.write(f"\r[{i+1}/{len(tasks)}] {y}-{m:02d}: {status} ({rows:,} rows)")
+                sys.stdout.flush()
+
+            except Exception as e:
+                print(f"\nWorker Error {y}-{m:02d}: {e}")
+
+    elapsed = time.perf_counter() - start_time
+    mps = (total_rows / elapsed) / 1_000_000 if elapsed > 0 else 0
+
+    print("\n\n--- Performance Summary ---")
+    print(f"Total Rows:     {total_rows:,}")
+    print(f"Throughput:     {mps:.2f} Million Rows/sec")
+    print(f"Time Elapsed:   {elapsed:.2f}s")
+    print(f"Corrupt Months: {corruption_count}")
+
+    report = {
+        "meta": {
+            "timestamp": dt.datetime.now().isoformat(),
+            "hardware": "AMD Ryzen 9 7900X",
+            "runtime": "Python 3.14t",
+            "total_rows": total_rows,
+            "elapsed_seconds": elapsed,
+        },
+        "details": sorted(results, key=lambda x: x["period"]),
+    }
+
+    with open(str(CONFIG["REPORT_FILE"]), "w") as f:
+        json.dump(report, f, indent=2)
+
+if __name__ == "__main__":
+    main()
+```
+
+// --- End File: verify.py ---
+
