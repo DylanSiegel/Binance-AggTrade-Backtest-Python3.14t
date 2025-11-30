@@ -1,15 +1,21 @@
 """
-algo.py — Adaptive Microstructure Alpha Engine (v4.0)
+algo.py — Adaptive Microstructure Alpha Engine (v4.1)
 
 Designed for:
 - Python 3.14t (free-threaded, -X gil=0)
-- Your AGG2 backtest stack (BTCUSDT futures data, etc.)
+- AGG2 backtest stack (BTCUSDT etc.)
 
 Key properties:
 - Pure stdlib, no NumPy / pandas / multiprocessing.
 - Single-pass tick processing with volume bars.
-- Adaptive feature normalization and online correlation-based weighting.
-- Continuous alpha score A_t with dynamic thresholds (no fixed bps levels).
+- Adaptive EWMA correlation-based feature weighting.
+- Continuous alpha score A_t with quantile-based threshold.
+- Uses:
+    * Flow–impact residual
+    * Flow reversal (short vs long horizon)
+    * Iceberg / exhaustion proxy
+    * Short-horizon toxicity regime
+    * Microbar sign persistence (trendiness of micro flow)
 
 External interface:
 - Row: AGG2 row tuple.
@@ -26,63 +32,105 @@ Row = tuple[int, int, int, int, int, int, int, int]
 RowIter = Iterable[Row]
 
 
-class OnlineCorr:
-    """Online correlation tracker between x and y using running sums."""
+class EWMAStat:
+    """
+    Exponentially Weighted Mean/Variance tracker.
+    """
 
-    __slots__ = ("n", "sum_x", "sum_y", "sum_xx", "sum_yy", "sum_xy")
+    __slots__ = ("alpha", "initialized", "mean", "var")
 
-    def __init__(self) -> None:
-        self.n = 0
-        self.sum_x = 0.0
-        self.sum_y = 0.0
-        self.sum_xx = 0.0
-        self.sum_yy = 0.0
-        self.sum_xy = 0.0
-
-    def update(self, x: float, y: float) -> None:
-        self.n += 1
-        self.sum_x += x
-        self.sum_y += y
-        self.sum_xx += x * x
-        self.sum_yy += y * y
-        self.sum_xy += x * y
-
-    def corr(self) -> float:
-        n = self.n
-        if n < 10:
-            return 0.0
-        num = n * self.sum_xy - self.sum_x * self.sum_y
-        den_x = n * self.sum_xx - self.sum_x * self.sum_x
-        den_y = n * self.sum_yy - self.sum_y * self.sum_y
-        if den_x <= 0.0 or den_y <= 0.0:
-            return 0.0
-        return num / math.sqrt(den_x * den_y)
-
-
-class OnlineMeanVar:
-    """Welford-style mean/std estimator."""
-
-    __slots__ = ("n", "mean", "M2")
-
-    def __init__(self) -> None:
-        self.n = 0
+    def __init__(self, alpha: float) -> None:
+        self.alpha = alpha
+        self.initialized = False
         self.mean = 0.0
-        self.M2 = 0.0
+        self.var = 0.0
 
     def update(self, x: float) -> None:
-        self.n += 1
-        delta = x - self.mean
-        self.mean += delta / self.n
-        delta2 = x - self.mean
-        self.M2 += delta * delta2
+        a = self.alpha
+        if not self.initialized:
+            self.mean = x
+            self.var = 0.0
+            self.initialized = True
+            return
+        m = self.mean
+        delta = x - m
+        m_new = m + a * delta
+        # Approximate EWMA variance update
+        self.var = (1.0 - a) * (self.var + a * delta * delta)
+        self.mean = m_new
 
     def stats(self) -> tuple[float, float]:
-        if self.n < 2:
-            return (self.mean, 0.0)
-        var = self.M2 / (self.n - 1)
-        if var < 0.0:
-            var = 0.0
-        return (self.mean, math.sqrt(var))
+        if not self.initialized:
+            return (0.0, 0.0)
+        v = self.var
+        if v < 0.0:
+            v = 0.0
+        return (self.mean, math.sqrt(v))
+
+
+class EWMACorr:
+    """
+    Exponentially Weighted Correlation tracker between x and y.
+    """
+
+    __slots__ = (
+        "alpha",
+        "initialized",
+        "Ex",
+        "Ey",
+        "Exx",
+        "Eyy",
+        "Exy",
+        "count",
+    )
+
+    def __init__(self, alpha: float) -> None:
+        self.alpha = alpha
+        self.initialized = False
+        self.Ex = 0.0
+        self.Ey = 0.0
+        self.Exx = 0.0
+        self.Eyy = 0.0
+        self.Exy = 0.0
+        self.count = 0
+
+    def update(self, x: float, y: float) -> None:
+        a = self.alpha
+        if not self.initialized:
+            self.Ex = x
+            self.Ey = y
+            self.Exx = x * x
+            self.Eyy = y * y
+            self.Exy = x * y
+            self.initialized = True
+            self.count = 1
+            return
+
+        self.Ex = (1.0 - a) * self.Ex + a * x
+        self.Ey = (1.0 - a) * self.Ey + a * y
+        self.Exx = (1.0 - a) * self.Exx + a * (x * x)
+        self.Eyy = (1.0 - a) * self.Eyy + a * (y * y)
+        self.Exy = (1.0 - a) * self.Exy + a * (x * y)
+        self.count += 1
+
+    def corr(self) -> float:
+        if not self.initialized or self.count < 50:
+            return 0.0
+        Ex = self.Ex
+        Ey = self.Ey
+        Exx = self.Exx
+        Eyy = self.Eyy
+        Exy = self.Exy
+
+        var_x = Exx - Ex * Ex
+        var_y = Eyy - Ey * Ey
+        if var_x <= 1e-12 or var_y <= 1e-12:
+            return 0.0
+        num = Exy - Ex * Ey
+        den = math.sqrt(var_x * var_y)
+        if den <= 0.0:
+            return 0.0
+        return num / den
 
 
 class AlphaEngine:
@@ -100,6 +148,9 @@ class AlphaEngine:
         "flow_win_long",    # 30m
         "flow_sum_long",
         "flow_vol_long",
+        "flow_long_abs_ewma",
+        "flow_short_abs_ewma",
+        "meta_flow_sign",
 
         # Main volume bar (execution bar)
         "bar_target",
@@ -115,17 +166,16 @@ class AlphaEngine:
         "bar_timestamp",
         "avg_bar_ms",
 
-        # Micro volume bar (flow / sign autocorr)
+        # Micro volume bar (for micro-flow sign persistence)
         "mvb_target",
         "mvb_vol",
         "mvb_buy_vol",
         "mvb_sell_vol",
         "mvb_open_px",
-        "mvb_close_px",
         "mvb_timestamp",
-        "mvb_sign_hist",    # recent micro-bar sign of return
+        "mvb_sign_hist",
 
-        # Residual / impact model (simplified directional model)
+        # Residual / impact model
         "window",           # (ts, lpx, cum_q) 3h window
         "anchor_ts",
         "anchor_x",
@@ -136,27 +186,36 @@ class AlphaEngine:
         "stats_counter",
 
         # Realized volatility on main bars
-        "ret_hist",         # log returns of main bars
+        "ret_hist",
         "sigma",
 
         # Iceberg / exhaustion
-        "ice_hist",         # iceberg score history
-        "last_ice_event_ts",
+        "ice_hist",
+        "ice_ewma",
+        "ice_z_prev",
+        "ice_z_now",
+
+        # Toxicity
+        "tox_ewma",
 
         # Adaptive feature stats
-        "feature_stats",    # list[OnlineCorr]
-        "feature_weights",  # list[float]
-        "prev_features",    # list[float] | None
+        "feature_corrs",
+        "feature_weights",
+        "prev_features",
         "have_prev_features",
-        "abs_alpha_stats",  # OnlineMeanVar
-        "last_alpha",
-        "last_alpha_ts",
-
-        # Misc
         "feature_update_skip",
         "feature_update_ctr",
         "alpha_scale",
         "max_weight",
+        "min_weight_for_trading",
+        "corr_alpha",
+
+        # Alpha distribution (for threshold)
+        "abs_alpha_hist",
+        "alpha_quantile",
+        "min_alpha_hist",
+
+        # Misc
         "symbol",
     )
 
@@ -178,7 +237,11 @@ class AlphaEngine:
         self.flow_sum_long = 0.0
         self.flow_vol_long = 0.0
 
-        # Main bar: modest size for more observations
+        self.flow_long_abs_ewma = EWMAStat(alpha=0.01)
+        self.flow_short_abs_ewma = EWMAStat(alpha=0.01)
+        self.meta_flow_sign = 0.0
+
+        # Main bar: moderate volume for more observations
         self.bar_target = 250.0
         self.bar_vol = 0.0
         self.bar_buy_vol = 0.0
@@ -190,15 +253,14 @@ class AlphaEngine:
         self.bar_low_px = 0.0
         self.bar_close_px = 0.0
         self.bar_timestamp = 0
-        self.avg_bar_ms = 60_000.0  # initial guess: ~1 minute
+        self.avg_bar_ms = 60_000.0  # initial guess ~1 minute
 
-        # Micro volume bar
+        # Micro bar
         self.mvb_target = 50.0
         self.mvb_vol = 0.0
         self.mvb_buy_vol = 0.0
         self.mvb_sell_vol = 0.0
         self.mvb_open_px = 0.0
-        self.mvb_close_px = 0.0
         self.mvb_timestamp = 0
         self.mvb_sign_hist = deque(maxlen=64)
 
@@ -219,22 +281,31 @@ class AlphaEngine:
 
         # Iceberg / exhaustion
         self.ice_hist = deque(maxlen=64)
-        self.last_ice_event_ts = 0
+        self.ice_ewma = EWMAStat(alpha=0.02)
+        self.ice_z_prev = 0.0
+        self.ice_z_now = 0.0
 
-        # Adaptive feature stats: 4 core features
-        self.feature_stats = [OnlineCorr() for _ in range(4)]
-        self.feature_weights = [0.0 for _ in range(4)]
-        self.prev_features: list[float] | None = None
+        # Toxicity
+        self.tox_ewma = EWMAStat(alpha=0.02)
+
+        # Features and correlations
+        self.corr_alpha = 0.01
+        num_features = 5  # residual, flow, iceberg, toxicity, micro-sign-persistence
+        self.feature_corrs = [EWMACorr(self.corr_alpha) for _ in range(num_features)]
+        self.feature_weights = [0.0 for _ in range(num_features)]
+        self.prev_features = None
         self.have_prev_features = False
 
-        self.abs_alpha_stats = OnlineMeanVar()
-        self.last_alpha = 0.0
-        self.last_alpha_ts = 0
-
-        self.feature_update_skip = 10  # update weights every N bars
+        self.feature_update_skip = 5
         self.feature_update_ctr = 0
         self.alpha_scale = 1.0
         self.max_weight = 1.0
+        self.min_weight_for_trading = 0.05
+
+        # Alpha distribution for threshold
+        self.abs_alpha_hist = deque(maxlen=1024)
+        self.alpha_quantile = 0.97   # roughly top 3% absolute alpha
+        self.min_alpha_hist = 200    # bars before using quantile
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -265,8 +336,7 @@ class AlphaEngine:
 
     def _update_residual_model(self, ts: int, lpx: float, signed_flow: float) -> float:
         """
-        Update simplified impact model: anchor at oldest point in ~3h window,
-        with cumulative signed flow, and compute residual.
+        Simplified directional impact model: anchor in ~3h window.
         """
         self.cum_q += signed_flow
         self.window.append((ts, lpx, self.cum_q))
@@ -284,7 +354,6 @@ class AlphaEngine:
         dq_abs = abs(dq_raw) + 1.0
         impact_sign = 1.0 if dq_raw >= 0.0 else -1.0
 
-        # Impact factor 0.4 (Kyle lambda proxy). Intercept adapts over time.
         theo = self.anchor_x + self.intercept + (0.4 * impact_sign * math.log(dq_abs))
         resid = lpx - theo
         self.resid_hist.append(resid)
@@ -302,7 +371,7 @@ class AlphaEngine:
 
                 # update intercept using sparse sampling
                 if len(self.window) >= 40:
-                    bases = []
+                    bases: list[float] = []
                     x0 = self.anchor_x
                     q0 = self.anchor_Q
                     for i in range(0, len(self.window), 4):
@@ -339,9 +408,15 @@ class AlphaEngine:
                 self.sigma = math.sqrt(m2)
         return r
 
-    def _compute_iceberg_score(self, price_change: float, qty: float, count: int) -> float:
+    def _compute_iceberg_score(
+        self,
+        price_change: float,
+        qty: float,
+        count: int,
+    ) -> float:
         """
         Iceberg score: high count, high volume, low impact.
+        Also updates EWMA z-scores for exhaustion logic.
         """
         sig = self.sigma if self.sigma > 1e-8 else 1e-8
         if qty <= 0.0:
@@ -353,19 +428,50 @@ class AlphaEngine:
             score = float(count) * (1.0 - impact_rel)
 
         self.ice_hist.append(score)
+        self.ice_ewma.update(score)
+        mu_ice, sd_ice = self.ice_ewma.stats()
+        prev_z = self.ice_z_now
+        if sd_ice > 1e-8:
+            z_now = (score - mu_ice) / sd_ice
+        else:
+            z_now = 0.0
+        self.ice_z_prev = prev_z
+        self.ice_z_now = z_now
         return score
+
+    def _micro_sign_persistence(self) -> float:
+        """
+        Approximate micro-flow sign autocorrelation using micro-bar signs.
+        Returns value in [-1, 1].
+        """
+        hist = self.mvb_sign_hist
+        n = len(hist)
+        if n < 4:
+            return 0.0
+        num = 0.0
+        den = 0.0
+        prev = hist[0]
+        for i in range(1, n):
+            s = hist[i]
+            num += s * prev
+            den += 1.0
+            prev = s
+        if den == 0.0:
+            return 0.0
+        # Already in [-1,1]
+        return num / den
 
     def _feature_vector(
         self,
         ts: int,
         resid: float,
-        signed_flow: float,
+        bar_signed_flow: float,
         total_vol: float,
         ice_score: float,
     ) -> list[float]:
         """
-        Build a 4-dimensional feature vector for this main bar.
-        Each feature is squashed into [-1, 1].
+        Build feature vector for this main bar.
+        Features in [-1, 1].
         """
 
         # 1) Residual feature: large positive resid is bearish, negative is bullish
@@ -374,68 +480,98 @@ class AlphaEngine:
         else:
             z_resid = 0.0
         z_resid = max(-10.0, min(10.0, z_resid))
-        f_resid = -math.tanh(0.5 * z_resid)  # positive when resid is negative (cheap vs impact)
+        f_resid = -math.tanh(0.5 * z_resid)
 
-        # 2) Flow reversal feature
+        # 2) Flow reversal feature: long vs short horizon imbalance
         eps = 1e-8
         long_norm = 0.0
+        short_norm = 0.0
+
         if self.flow_vol_long > eps:
             long_norm = self.flow_sum_long / self.flow_vol_long
-        short_norm = 0.0
         if self.flow_vol_short > eps:
             short_norm = self.flow_sum_short / self.flow_vol_short
 
-        # large discrepancy between long-term imbalance and short-term move is "reversal"
-        flow_reversal_raw = -(long_norm * short_norm)
-        f_flow = math.tanh(2.0 * flow_reversal_raw)
+        # Update EWMA of absolute flow norms to get adaptive scale
+        if self.flow_vol_long > eps:
+            self.flow_long_abs_ewma.update(abs(long_norm))
+        if self.flow_vol_short > eps:
+            self.flow_short_abs_ewma.update(abs(short_norm))
+
+        mu_long, _ = self.flow_long_abs_ewma.stats()
+        mu_short, _ = self.flow_short_abs_ewma.stats()
+
+        # meta-flow sign: direction of longer-term flow
+        if long_norm > 0.0:
+            self.meta_flow_sign = 1.0
+        elif long_norm < 0.0:
+            self.meta_flow_sign = -1.0
+        else:
+            self.meta_flow_sign = 0.0
+
+        # Gate: only consider if both norms are meaningfully non-zero
+        min_scale_long = max(mu_long * 0.5, 1e-5)
+        min_scale_short = max(mu_short * 0.5, 1e-5)
+
+        if (
+            abs(long_norm) < min_scale_long
+            or abs(short_norm) < min_scale_short
+        ):
+            f_flow = 0.0
+        else:
+            # Reversal: long and short with opposite signs
+            flow_reversal_raw = -(long_norm * short_norm)
+            f_flow = math.tanh(2.0 * flow_reversal_raw)
 
         # 3) Iceberg exhaustion feature:
-        if len(self.ice_hist) >= 10:
-            mu_ice = statistics.fmean(self.ice_hist)
-            sd_ice = statistics.pstdev(self.ice_hist, mu_ice)
-            if sd_ice > 1e-8:
-                z_ice = (ice_score - mu_ice) / sd_ice
-            else:
-                z_ice = 0.0
-        else:
-            z_ice = 0.0
+        # If we were recently in high z_ice and now z_ice dropped,
+        # fade prior meta-flow direction.
+        z_prev = self.ice_z_prev
+        z_now = self.ice_z_now
 
-        if len(self.ice_hist) >= 2:
-            prev = list(self.ice_hist)[-2]
-            delta_ice = ice_score - prev
-        else:
-            delta_ice = 0.0
-
-        # negative delta after generally high scores => exhaustion (mean-reversion friendly)
         f_ice = 0.0
-        if len(self.ice_hist) >= 10:
-            f_ice = -math.tanh(0.5 * delta_ice)
+        if abs(self.meta_flow_sign) > 0.0:
+            # exhaustion if prior was elevated and now normalized/lower
+            if z_prev > 1.5 and z_now < 0.5:
+                # Fade previous meta-flow
+                f_ice = -self.meta_flow_sign
+            elif z_prev < -1.5 and z_now > -0.5:
+                # Opposite meta-flow case (persistent selling exhausted)
+                f_ice = -self.meta_flow_sign
 
-        # 4) Toxicity / volatility regime feature:
+        # 4) Toxicity / regime feature:
         tox_raw = 0.0
         if self.flow_vol_short > eps:
             tox_raw = abs(self.flow_sum_short) / self.flow_vol_short
 
-        sig = self.sigma if self.sigma > 1e-8 else 1e-8
-        tox_scaled = tox_raw / sig
-        # moderate / declining toxicity is favourable to mean reversion
-        f_tox = -math.tanh(0.1 * (tox_scaled - 1.0))
+        self.tox_ewma.update(tox_raw)
+        mu_tox, sd_tox = self.tox_ewma.stats()
+        if sd_tox > 1e-8:
+            z_tox = (tox_raw - mu_tox) / sd_tox
+        else:
+            z_tox = 0.0
 
-        return [f_resid, f_flow, f_ice, f_tox]
+        # High toxicity is bad for MR; moderate is okay.
+        f_tox = -math.tanh(0.5 * z_tox)
+
+        # 5) Microbar sign persistence: positive = trending micro-flow
+        micro_pers = self._micro_sign_persistence()
+        # Let correlation decide whether trendiness is good or bad
+        f_mvb = micro_pers
+
+        return [f_resid, f_flow, f_ice, f_tox, f_mvb]
 
     def _update_feature_weights(self, bar_return: float) -> None:
         """
-        Online correlation-based weight update:
-
-        We use s_{t-1} and r_t to update correlations. Then we map
-        correlations to weights in [-max_weight, max_weight].
+        Update EWMA correlations and map them to weights.
+        Uses s_{t-1} and r_t.
         """
         if not self.have_prev_features or self.prev_features is None:
             return
 
-        # Update correlations for each feature
-        for i, f_prev in enumerate(self.prev_features):
-            self.feature_stats[i].update(f_prev, bar_return)
+        feats_prev = self.prev_features
+        for i, f_prev in enumerate(feats_prev):
+            self.feature_corrs[i].update(f_prev, bar_return)
 
         self.feature_update_ctr += 1
         if self.feature_update_ctr < self.feature_update_skip:
@@ -443,7 +579,7 @@ class AlphaEngine:
         self.feature_update_ctr = 0
 
         # Re-compute weights from correlations
-        for i, stat in enumerate(self.feature_stats):
+        for i, stat in enumerate(self.feature_corrs):
             c = stat.corr()
             w = c * self.alpha_scale
             if w > self.max_weight:
@@ -458,39 +594,52 @@ class AlphaEngine:
         features: list[float],
     ) -> int:
         """
-        Compute alpha score A_t and decide signal sign based on adaptive threshold.
-        Returns -1, 0, +1.
+        Compute alpha score A_t and decide signal based on adaptive quantile
+        of |alpha|. Returns -1, 0, +1.
         """
-        # linear combo
+        # Linear combo
         A = 0.0
         for w, f in zip(self.feature_weights, features):
             A += w * f
-        self.last_alpha = A
-        self.last_alpha_ts = ts
 
-        # update absolute alpha statistics
         abs_A = abs(A)
-        self.abs_alpha_stats.update(abs_A)
-        mean_abs, std_abs = self.abs_alpha_stats.stats()
+        hist = self.abs_alpha_hist
 
-        # need some history for stable threshold
-        if self.abs_alpha_stats.n < 100:
-            self.prev_features = features
-            self.have_prev_features = True
-            return 0
+        # Can we trade yet?
+        max_w = 0.0
+        for w in self.feature_weights:
+            if abs(w) > max_w:
+                max_w = abs(w)
 
-        # adaptive threshold: mean(|A|) + k * std(|A|)
-        k_thr = 1.5
-        thr = mean_abs + k_thr * std_abs
-        if thr <= 0.0:
-            thr = mean_abs if mean_abs > 0.0 else 0.0
+        can_trade = (
+            len(hist) >= self.min_alpha_hist
+            and max_w >= self.min_weight_for_trading
+        )
 
         sig = 0
-        if abs_A >= thr and A != 0.0:
-            sig = 1 if A > 0.0 else -1
 
+        if can_trade:
+            # Threshold from previous alpha history (exclude current A)
+            arr = sorted(hist)
+            n = len(arr)
+            if n > 0:
+                idx = int(round((n - 1) * self.alpha_quantile))
+                if idx < 0:
+                    idx = 0
+                if idx >= n:
+                    idx = n - 1
+                thr = arr[idx]
+                if thr < 0.0:
+                    thr = 0.0
+
+                if abs_A >= thr and A != 0.0:
+                    sig = 1 if A > 0.0 else -1
+
+        # Update history and previous features for next bar
+        hist.append(abs_A)
         self.prev_features = features
         self.have_prev_features = True
+
         return sig
 
     # ------------------------------------------------------------------
@@ -499,7 +648,7 @@ class AlphaEngine:
 
     def update_batch(self, rows: RowIter):
         """
-        High-Performance Vectorized Update.
+        High-performance vectorized update.
 
         Returns list of (ts_ms, px, side) trade signals.
         """
@@ -634,7 +783,7 @@ class AlphaEngine:
                 # Volatility update
                 bar_ret = self._update_sigma_and_returns(lpx)
 
-                # Iceberg score
+                # Iceberg score (updates z_ice as well)
                 price_change = self.bar_close_px - self.bar_open_px
                 ice_score = self._compute_iceberg_score(
                     price_change,
